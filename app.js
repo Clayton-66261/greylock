@@ -947,6 +947,16 @@ const Cloud = (() => {
   const renameTrack = (id, name) => F.updateDoc(F.doc(db, "users", uidNow(), "tracks", id), { name });
   const deleteTrack = (id) => Promise.all([F.deleteDoc(F.doc(db, "users", uidNow(), "tracks", id)), F.deleteDoc(F.doc(db, "users", uidNow(), "trackpts", id))]);
 
+  async function rename(name) {
+    const uid = uidNow();
+    await F.updateProfile(auth.currentUser, { displayName: name }).catch(() => {});
+    await F.setDoc(F.doc(db, "users", uid), { name, email: state.user.email || "" }, { merge: true });
+    if (state.profile) state.profile.name = name;
+    if (state.group) await F.updateDoc(F.doc(db, "groups", state.group.id), { [`names.${uid}`]: name });
+    for (const p of state.groupPins.filter((x) => x.ownerUid === uid)) F.updateDoc(pinRef(p.id, "group"), { ownerName: name }).catch(() => {});
+    for (const p of state.myPins) F.updateDoc(pinRef(p.id, "mine"), { ownerName: name }).catch(() => {});
+    emit("auth");
+  }
   async function deleteAccount(password) {
     const u = state.user, uid = u.uid;
     await F.reauthenticateWithCredential(u, F.EmailAuthProvider.credential(u.email, password));
@@ -969,7 +979,7 @@ const Cloud = (() => {
   return {
     state, init, on: (h) => handlers.add(h), signedIn: () => !!state.user, myName, uid: uidNow, cleanCode,
     signUp, signIn, signOut, resetPassword, createGroup, joinGroup, leaveGroup, removeMember, setLocked,
-    sendLive, stopLive, savePin, deletePin, getPhoto, optimistic, listTracks, getTrack, saveTrack, renameTrack, deleteTrack, deleteAccount,
+    sendLive, stopLive, savePin, deletePin, getPhoto, optimistic, listTracks, getTrack, saveTrack, renameTrack, deleteTrack, deleteAccount, rename,
   };
 })();
 
@@ -1385,7 +1395,13 @@ function renderGroup(open) {
       <div class="actions"><button class="btn primary" data-act="auth-submit">${mode === "signup" ? "Create account" : "Sign in"}</button>${mode === "signin" ? `<button class="btn" data-act="auth-reset">Forgot password</button>` : ""}</div></div>`;
   } else {
     const me_ = s.user, g = s.group;
-    html += `<div class="sec"><p style="margin:0">Signed in as <b>${esc(Cloud.myName())}</b></p><p class="note" style="margin-top:2px">${esc(me_.email || "")}</p></div>`;
+    if (renderGroup.editName) {
+      html += `<div class="sec"><label class="f" for="nameInput" style="margin-top:0">Your name, as your group sees it</label>
+        <div class="row"><input class="input grow" id="nameInput" maxlength="40" autocomplete="name" value="${esc(Cloud.myName() === "Hunter" ? "" : Cloud.myName())}"><button class="btn primary" data-act="name-save">Save</button></div>
+        <div class="actions" style="margin-top:6px"><button class="btn" data-act="name-cancel">Cancel</button></div><div class="warn" id="nameErr" hidden></div></div>`;
+    } else {
+      html += `<div class="sec"><div class="row"><div class="grow"><p style="margin:0">Signed in as <b>${esc(Cloud.myName())}</b></p><p class="note" style="margin-top:2px">${esc(me_.email || "")}</p></div><button class="btn" data-act="name-edit" aria-label="Change your name">Change name</button></div></div>`;
+    }
     if (!g) {
       html += `<div class="sec"><h3>Join your group</h3><p class="note" style="margin-top:0">Enter the invite code someone in your group sent you.</p>
         <div class="row"><input class="input grow" id="joinCode" placeholder="ABCD-1234" autocapitalize="characters" autocomplete="off" maxlength="9" style="text-transform:uppercase;font-family:var(--font-data);font-size:20px;letter-spacing:.08em"><button class="btn primary" data-act="group-join">Join</button></div></div>
@@ -1418,7 +1434,7 @@ function renderGroup(open) {
   if (open || sheetKind !== "group") openSheet("Group", html, { kind: "group", tall: true });
   else {
     // keep typed values when live updates re-render the panel
-    const keep = ["authName", "authEmail", "authPw", "joinCode", "groupName"].map((idv) => [idv, $("#" + idv)?.value]);
+    const keep = ["authName", "authEmail", "authPw", "joinCode", "groupName", "nameInput"].map((idv) => [idv, $("#" + idv)?.value]);
     $("#sheetBody").innerHTML = html;
     keep.forEach(([idv, v]) => { const el = $("#" + idv); if (el && v) el.value = v; });
   }
@@ -2220,6 +2236,20 @@ document.addEventListener("click", async (e) => {
     case "mate-go": { const l = Cloud.state.live.find((x) => x.uid === el.dataset.uid); if (l) { closeSheet(); map.setView([l.lat, l.lng], Math.max(map.getZoom(), 16)); showMate(l.uid); } return; }
     case "guide-mate": { const l = Cloud.state.live.find((x) => x.uid === el.dataset.uid); if (l) startGuide({ lat: l.lat, lng: l.lng, name: firstName(l.name), uid: l.uid }); return; }
     case "move-local": return moveLocalToAccount();
+    case "name-edit": renderGroup.editName = true; renderGroup(); setTimeout(() => $("#nameInput") && $("#nameInput").focus(), 50); return;
+    case "name-cancel": renderGroup.editName = false; return renderGroup();
+    case "name-save": {
+      const n = ($("#nameInput").value || "").trim();
+      if (!n) return showErr("nameErr", "Enter a name so your group knows who you are.");
+      try {
+        await Cloud.rename(n);
+        renderGroup.editName = false;
+        if (share.on) maybeSendLive(true);
+        toast("Name updated");
+        renderGroup();
+      } catch (err) { showErr("nameErr", friendlyError(err)); }
+      return;
+    }
     case "account-delete": {
       if (!confirm("Delete your account? Your private pins, tracks and shared pins are removed for good.")) return;
       const pw = prompt("Enter your password to confirm");
