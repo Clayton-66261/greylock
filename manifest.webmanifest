@@ -1,0 +1,16 @@
+{
+  "name": "Greylock Hunt Map",
+  "short_name": "Greylock",
+  "description": "Massachusetts land ownership, public land, waypoints, tracks, wind and seasons. Works offline.",
+  "start_url": "./index.html",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#1E2B24",
+  "theme_color": "#1E2B24",
+  "icons": [
+    { "src": "icons/icon-192.png", "sizes": "192x192", "type": "image/png" },
+    { "src": "icons/icon-512.png", "sizes": "512x512", "type": "image/png" },
+    { "src": "icons/icon-maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ]
+}
