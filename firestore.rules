@@ -1,0 +1,70 @@
+rules_version = '2';
+
+// Greylock security rules. Paste into Firebase console → Firestore Database → Rules → Publish.
+//
+// users/{uid}/...            only that person can read or write (private pins, tracks)
+// groups/{code}              the invite code is the document id; anyone signed in who
+//                            knows it can look it up and join (unless locked)
+// groups/{code}/pins|live    members only; shared pins editable by their creator or the owner
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() { return request.auth != null; }
+    function groupData(gid) { return get(/databases/$(database)/documents/groups/$(gid)).data; }
+    function isMember(gid) { return signedIn() && request.auth.uid in groupData(gid).members; }
+    function isGroupOwner(gid) { return signedIn() && groupData(gid).ownerUid == request.auth.uid; }
+    function onlyChanges(keys) { return request.resource.data.diff(resource.data).affectedKeys().hasOnly(keys); }
+
+    match /users/{uid}/{document=**} {
+      allow read, write: if signedIn() && request.auth.uid == uid;
+    }
+
+    match /groups/{gid} {
+      allow get: if signedIn();
+      allow list: if false;
+
+      allow create: if signedIn()
+        && request.resource.data.ownerUid == request.auth.uid
+        && request.resource.data.members == [request.auth.uid];
+
+      allow update: if signedIn() && (
+        // the owner can rename, lock, or remove members
+        (resource.data.ownerUid == request.auth.uid
+          && request.resource.data.ownerUid == resource.data.ownerUid)
+        // join: add only yourself, while the group is unlocked
+        || (!resource.data.get('locked', false)
+          && !(request.auth.uid in resource.data.members)
+          && onlyChanges(['members', 'names'])
+          && request.resource.data.members.toSet() == resource.data.members.toSet().union([request.auth.uid].toSet()))
+        // leave: remove only yourself
+        || (request.auth.uid in resource.data.members
+          && request.auth.uid != resource.data.ownerUid
+          && onlyChanges(['members', 'names'])
+          && request.resource.data.members.toSet() == resource.data.members.toSet().difference([request.auth.uid].toSet()))
+      );
+
+      allow delete: if signedIn() && resource.data.ownerUid == request.auth.uid;
+
+      match /pins/{pinId} {
+        allow read: if isMember(gid);
+        allow create: if isMember(gid) && request.resource.data.ownerUid == request.auth.uid;
+        allow update: if isMember(gid)
+          && (resource.data.ownerUid == request.auth.uid || isGroupOwner(gid))
+          && request.resource.data.ownerUid == resource.data.ownerUid;
+        allow delete: if isMember(gid)
+          && (resource.data.ownerUid == request.auth.uid || isGroupOwner(gid));
+
+        match /media/{mediaId} {
+          allow read, write: if isMember(gid);
+        }
+      }
+
+      match /live/{uid} {
+        allow read: if isMember(gid);
+        allow write: if isMember(gid) && request.auth.uid == uid;
+        allow delete: if isGroupOwner(gid);
+      }
+    }
+  }
+}

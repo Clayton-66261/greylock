@@ -306,6 +306,19 @@ textarea.input { min-height: 84px; resize: vertical; }
 .toast { position: fixed; z-index: 1100; left: 50%; bottom: calc(var(--tabs-h) + env(safe-area-inset-bottom) + 80px); transform: translateX(-50%) translateY(12px); opacity: 0; pointer-events: none; transition: all .22s; background: var(--hemlock); color: var(--strip-ink); padding: 11px 16px; border-radius: 12px; font-size: 15px; box-shadow: var(--shadow); max-width: calc(100% - 32px); text-align: center; }
 .toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
 
+
+/* group */
+.fab { position: relative; }
+.fab[data-count]:not([data-count=""])::after { content: attr(data-count); position: absolute; top: -4px; right: -4px; min-width: 20px; height: 20px; padding: 0 5px; border-radius: 10px; background: var(--public); color: #fff; font: 700 12px/20px var(--font-data); text-align: center; box-shadow: 0 0 0 2px var(--surface); }
+.mate { position: relative; width: 34px; height: 34px; }
+.mate span { position: absolute; inset: 0; border-radius: 50%; display: grid; place-items: center; color: #fff; font: 700 13px/1 var(--font-data); border: 3px solid #fff; box-shadow: 0 2px 6px rgba(0,0,0,.45); }
+.mate b { position: absolute; left: 50%; top: 37px; transform: translateX(-50%); white-space: nowrap; padding: 2px 7px; border-radius: 8px; background: rgba(20,28,24,.85); color: #fff; font: 600 12.5px/1.3 var(--font-data); }
+.mate.stale span { filter: grayscale(.85); opacity: .7; }
+.mate.stale b { opacity: .8; }
+.code { font: 700 38px/1.1 var(--font-data); letter-spacing: .08em; margin: 2px 0 0; }
+.today-card .btn { background: var(--hemlock-2); color: var(--strip-ink); }
+.item .ti { color: #fff; }
+
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { transition: none !important; animation: none !important; }
 }
@@ -334,6 +347,9 @@ textarea.input { min-height: 84px; resize: vertical; }
 <div class="fabs">
   <button class="fab" data-act="tab" data-tab="layers" aria-label="Map layers and offline maps">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" aria-hidden="true"><path d="M12 3l9 5-9 5-9-5 9-5z"/><path d="M3 13l9 5 9-5"/></svg>
+  </button>
+  <button class="fab" id="btnGroup" data-act="tab" data-tab="group" aria-label="Group: shared pins and live locations">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="9" cy="8" r="3.2"/><path d="M3 19c.6-3.4 3-5.2 6-5.2s5.4 1.8 6 5.2"/><circle cx="17" cy="9" r="2.5"/><path d="M16.5 13.9c2.4.2 4 1.7 4.5 4.6"/></svg>
   </button>
   <button class="fab" id="btnLocate" data-act="locate" aria-label="Center on my location">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="6.5"/><circle cx="12" cy="12" r="2" fill="currentColor"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3"/></svg>
@@ -382,6 +398,8 @@ textarea.input { min-height: 84px; resize: vertical; }
 <script src="vendor/leaflet/leaflet.js"></script>
 <script src="vendor/suncalc.js"></script>
 <script src="seasons.js"></script>
+<script src="firebase-config.js"></script>
+<script src="vendor/firebase.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

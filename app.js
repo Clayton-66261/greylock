@@ -342,6 +342,7 @@ function onPos(p) {
   }
   if (follow) map.panTo([me.lat, me.lng], { animate: true });
   onTrackPoint(me);
+  maybeSendLive();
   updateGuide();
   if (coneOn) drawConeThrottled();
   slowUpdates();
@@ -513,6 +514,7 @@ function cleanupSheet(oldKind, newKind) {
   if (oldKind === "edit-pin" && newKind !== "edit-pin") cancelEdit();
   if (oldKind === "pin" && newKind !== "pin") openPinId = null;
   if (oldKind === "download" && newKind !== "download") clearDownloadBox();
+  if (oldKind === "mate" && newKind !== "mate") showMate.uid = null;
 }
 // drag the grip down to close
 (() => {
@@ -537,6 +539,7 @@ function showTab(tab) {
   if (tab === "weather") { renderWeather(true); refreshWeather(); return; }
   if (tab === "regs") return renderRegs(true);
   if (tab === "layers") return renderLayers(true);
+  if (tab === "group") return renderGroup(true);
 }
 
 /* ================= status chips ================= */
@@ -545,6 +548,9 @@ function renderChips() {
   let html = "";
   if (navigator.onLine === false) {
     html += `<div class="chip offline" role="status"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M2 8.5a15 15 0 0 1 20 0M5 12a10 10 0 0 1 14 0M8.5 15.5a5 5 0 0 1 7 0M3 3l18 18"/></svg>Offline. Saved areas still work.</div>`;
+  }
+  if (share.on && Cloud.state.group) {
+    html += `<button class="chip" data-act="tab" data-tab="group"><span class="dot" style="background:var(--blaze)"></span>Sharing location with ${esc(Cloud.state.group.name)}</button>`;
   }
   if (rec) {
     html += `<button class="chip" data-act="tab" data-tab="tracks"><span class="dot"></span>Recording ${fmtDist(rec.dist)}, ${fmtClock(Date.now() - rec.start)}</button>`;
@@ -740,6 +746,249 @@ function nice(s) {
     .replace(/\bMc([a-z])/g, (m, c) => "Mc" + c.toUpperCase());
 }
 
+/* ================= accounts and group sync (Firebase) ================= */
+const Cloud = (() => {
+  const cfg = window.GREYLOCK_FIREBASE || {};
+  const F = window.FB;
+  const enabled = !!(cfg.apiKey && cfg.projectId && F);
+  let auth = null, db = null;
+  const state = { enabled, ready: !enabled, user: null, profile: null, group: null, groupPins: [], myPins: [], live: [], error: null };
+  const subs = {};
+  const handlers = new Set();
+  const emit = (what) => handlers.forEach((h) => { try { h(what); } catch (e) { console.error(e); } });
+  const unsub = (...keys) => keys.forEach((k) => { if (subs[k]) { subs[k](); subs[k] = null; } });
+  const uidNow = () => state.user && state.user.uid;
+  const myName = () => (state.profile && state.profile.name) || (state.user && state.user.displayName) || "Hunter";
+
+  function init() {
+    if (!enabled) return;
+    try {
+      const app = F.initializeApp(cfg);
+      auth = F.initializeAuth(app, { persistence: [F.indexedDBLocalPersistence, F.browserLocalPersistence] });
+      db = F.initializeFirestore(app, { ignoreUndefinedProperties: true, localCache: F.persistentLocalCache({ tabManager: F.persistentMultipleTabManager() }) });
+      F.onAuthStateChanged(auth, onUser);
+    } catch (e) {
+      state.error = e.message;
+      state.ready = true;
+      emit("auth");
+    }
+  }
+  function onUser(u) {
+    unsub("user", "group", "gpins", "mpins", "live");
+    Object.assign(state, { user: u, profile: null, group: null, groupPins: [], myPins: [], live: [], ready: true });
+    emit("auth"); emit("pins"); emit("live");
+    if (!u) return;
+    subs.user = F.onSnapshot(F.doc(db, "users", u.uid), (snap) => {
+      const prev = state.profile ? state.profile.groupId : undefined;
+      state.profile = snap.exists() ? snap.data() : { name: u.displayName || "", groupId: null };
+      if (state.profile.groupId !== prev) attachGroup(state.profile.groupId);
+      emit("auth");
+    }, (e) => { state.error = e.message; emit("auth"); });
+    subs.mpins = F.onSnapshot(F.collection(db, "users", u.uid, "pins"), (snap) => {
+      state.myPins = snap.docs.map((d) => ({ ...d.data(), id: d.id, src: "mine" }));
+      emit("pins");
+    }, () => {});
+  }
+  function attachGroup(gid) {
+    unsub("group", "gpins", "live");
+    state.group = null; state.groupPins = []; state.live = [];
+    emit("pins"); emit("live");
+    if (!gid) return;
+    subs.group = F.onSnapshot(F.doc(db, "groups", gid), (snap) => {
+      const g = snap.exists() ? { ...snap.data(), id: snap.id } : null;
+      if (!g || !(g.members || []).includes(uidNow())) {
+        // the group was deleted or the owner removed us
+        state.group = null; state.groupPins = []; state.live = [];
+        unsub("gpins", "live");
+        F.setDoc(F.doc(db, "users", uidNow()), { groupId: null }, { merge: true }).catch(() => {});
+        emit("auth"); emit("pins"); emit("live");
+        return;
+      }
+      state.group = g;
+      emit("auth");
+    }, () => { state.group = null; emit("auth"); });
+    subs.gpins = F.onSnapshot(F.collection(db, "groups", gid, "pins"), (snap) => {
+      state.groupPins = snap.docs.map((d) => ({ ...d.data(), id: d.id, src: "group" }));
+      emit("pins");
+    }, () => {});
+    subs.live = F.onSnapshot(F.collection(db, "groups", gid, "live"), (snap) => {
+      state.live = snap.docs.map((d) => ({ ...d.data(), uid: d.id }));
+      emit("live");
+    }, () => {});
+  }
+
+  // reads that fall back to the on-phone copy instead of hanging without signal
+  const timeout = (ms) => new Promise((_, rej) => setTimeout(() => rej(new Error("timeout")), ms));
+  async function getDocsSmart(q) { try { return await Promise.race([F.getDocs(q), timeout(6000)]); } catch (e) { return F.getDocsFromCache(q); } }
+  async function getDocSmart(r) { try { return await Promise.race([F.getDoc(r), timeout(6000)]); } catch (e) { return F.getDocFromCache(r); } }
+
+  /* accounts */
+  async function signUp(name, email, pw) {
+    const cred = await F.createUserWithEmailAndPassword(auth, email, pw);
+    await F.updateProfile(cred.user, { displayName: name });
+    await F.setDoc(F.doc(db, "users", cred.user.uid), { name, email, groupId: null, created: Date.now() }, { merge: true });
+  }
+  const signIn = (email, pw) => F.signInWithEmailAndPassword(auth, email, pw);
+  const signOut = () => F.signOut(auth);
+  const resetPassword = (email) => F.sendPasswordResetEmail(auth, email);
+
+  /* groups: the 8-character invite code is the group's document id */
+  const CODE_CHARS = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ";
+  const newCode = () => Array.from(crypto.getRandomValues(new Uint32Array(8)), (n) => CODE_CHARS[n % CODE_CHARS.length]).join("");
+  const cleanCode = (c) => String(c || "").toUpperCase().replace(/[^0-9A-Z]/g, "");
+  async function createGroup(name) {
+    const uid = uidNow(), code = newCode();
+    await F.setDoc(F.doc(db, "groups", code), { name: name || "Hunting group", ownerUid: uid, members: [uid], names: { [uid]: myName() }, locked: false, created: Date.now() });
+    await F.setDoc(F.doc(db, "users", uid), { groupId: code }, { merge: true });
+    return code;
+  }
+  async function joinGroup(raw) {
+    const code = cleanCode(raw), uid = uidNow();
+    if (code.length !== 8) throw new Error("Invite codes are 8 letters and numbers.");
+    const ref = F.doc(db, "groups", code);
+    const snap = await F.getDoc(ref);
+    if (!snap.exists()) throw new Error("No group uses that code. Check it with whoever sent it.");
+    const g = snap.data();
+    if (!(g.members || []).includes(uid)) {
+      if (g.locked) throw new Error("That group isn’t taking new members right now.");
+      await F.updateDoc(ref, { members: F.arrayUnion(uid), [`names.${uid}`]: myName() });
+    }
+    await F.setDoc(F.doc(db, "users", uid), { groupId: code }, { merge: true });
+  }
+  async function leaveGroup() {
+    const g = state.group, uid = uidNow();
+    if (!g) return;
+    await F.deleteDoc(F.doc(db, "groups", g.id, "live", uid)).catch(() => {});
+    if (g.ownerUid === uid) await F.deleteDoc(F.doc(db, "groups", g.id));
+    else await F.updateDoc(F.doc(db, "groups", g.id), { members: F.arrayRemove(uid), [`names.${uid}`]: F.deleteField() });
+    await F.setDoc(F.doc(db, "users", uid), { groupId: null }, { merge: true });
+  }
+  async function removeMember(memberUid) {
+    const g = state.group;
+    await F.updateDoc(F.doc(db, "groups", g.id), { members: F.arrayRemove(memberUid), [`names.${memberUid}`]: F.deleteField() });
+    F.deleteDoc(F.doc(db, "groups", g.id, "live", memberUid)).catch(() => {});
+  }
+  const setLocked = (locked) => F.updateDoc(F.doc(db, "groups", state.group.id), { locked });
+
+  /* live location: writes are queued by Firestore when there's no signal, so never await them in the GPS path */
+  function sendLive(p, hdg) {
+    if (!state.group || !uidNow()) return Promise.resolve();
+    return F.setDoc(F.doc(db, "groups", state.group.id, "live", uidNow()), {
+      name: myName(), lat: +p.lat.toFixed(6), lng: +p.lng.toFixed(6), acc: Math.round(p.acc || 0),
+      heading: hdg == null ? null : Math.round(hdg), sharing: true, ct: Date.now(), t: F.serverTimestamp(),
+    });
+  }
+  function stopLive() {
+    if (!state.group || !uidNow()) return Promise.resolve();
+    return F.setDoc(F.doc(db, "groups", state.group.id, "live", uidNow()), { name: myName(), sharing: false, ct: Date.now(), t: F.serverTimestamp() }, { merge: true });
+  }
+
+  /* pins: shared ones live in the group, private ones under your account */
+  const pinRef = (id, src) => (src === "group" ? F.doc(db, "groups", state.group.id, "pins", id) : F.doc(db, "users", uidNow(), "pins", id));
+  const mediaRef = (id, src) => F.doc(pinRef(id, src), "media", "photo");
+  async function getPhotoData(id, src) {
+    try { const s = await getDocSmart(mediaRef(id, src)); return s.exists() ? s.data().data : null; } catch (e) { return null; }
+  }
+  async function getPhoto(pin) {
+    const data = await getPhotoData(pin.id, pin.src);
+    return data ? (await fetch(data)).blob() : null;
+  }
+  function optimistic(pin, removeFrom) {
+    const lists = { group: "groupPins", mine: "myPins" };
+    if (removeFrom && lists[removeFrom]) state[lists[removeFrom]] = state[lists[removeFrom]].filter((p) => p.id !== pin.id);
+    if (pin && lists[pin.src]) state[lists[pin.src]] = [...state[lists[pin.src]].filter((p) => p.id !== pin.id), pin];
+    emit("pins");
+  }
+  // photo: undefined keeps the current one, null removes it, a Blob replaces it
+  async function savePin(pin, photo, prevSrc) {
+    const src = pin.shared && state.group ? "group" : "mine";
+    const { src: _ignored, ...rest } = pin;
+    const data = { ...rest, shared: src === "group", ownerUid: pin.ownerUid || uidNow(), ownerName: pin.ownerName || myName() };
+    const writes = [F.setDoc(pinRef(pin.id, src), data)];
+    let carried;
+    if (prevSrc && prevSrc !== src) {
+      if (photo === undefined) carried = await getPhotoData(pin.id, prevSrc);
+      writes.push(F.deleteDoc(mediaRef(pin.id, prevSrc)).catch(() => {}), F.deleteDoc(pinRef(pin.id, prevSrc)));
+    }
+    if (photo === null) writes.push(F.deleteDoc(mediaRef(pin.id, src)));
+    else if (photo) writes.push(F.setDoc(mediaRef(pin.id, src), { data: await blobToDataURL(await shrinkImage(photo, 800, 0.62)) }));
+    else if (carried) writes.push(F.setDoc(mediaRef(pin.id, src), { data: carried }));
+    Promise.all(writes).catch((e) => toast(`Couldn’t sync that pin: ${e.message}`, 4000));
+    const saved = { ...data, src };
+    optimistic(saved, prevSrc && prevSrc !== src ? prevSrc : null);
+    return saved;
+  }
+  function deletePin(pin) {
+    F.deleteDoc(mediaRef(pin.id, pin.src)).catch(() => {});
+    F.deleteDoc(pinRef(pin.id, pin.src)).catch((e) => toast(`Couldn’t delete that pin: ${e.message}`, 4000));
+    const key = pin.src === "group" ? "groupPins" : "myPins";
+    state[key] = state[key].filter((p) => p.id !== pin.id);
+    emit("pins");
+  }
+
+  /* tracks: a light summary document plus a separate one holding the points */
+  async function listTracks() {
+    const snap = await getDocsSmart(F.collection(db, "users", uidNow(), "tracks"));
+    return snap.docs.map((d) => ({ ...d.data(), id: d.id, src: "cloud" }));
+  }
+  async function getTrack(id) {
+    const [m, p] = await Promise.all([getDocSmart(F.doc(db, "users", uidNow(), "tracks", id)), getDocSmart(F.doc(db, "users", uidNow(), "trackpts", id)).catch(() => null)]);
+    if (!m.exists()) return null;
+    return { ...m.data(), id, src: "cloud", points: p && p.exists() ? JSON.parse(p.data().pts || "[]") : [] };
+  }
+  function saveTrack(t) {
+    let pts = t.points || [], json = JSON.stringify(pts);
+    while (json.length > 900000 && pts.length > 2) { pts = pts.filter((_, i) => i % 2 === 0 || i === pts.length - 1); json = JSON.stringify(pts); }
+    return Promise.all([
+      F.setDoc(F.doc(db, "users", uidNow(), "tracks", t.id), { name: t.name, start: t.start, end: t.end || null, dist: t.dist || 0, n: pts.length }),
+      F.setDoc(F.doc(db, "users", uidNow(), "trackpts", t.id), { pts: json }),
+    ]);
+  }
+  const renameTrack = (id, name) => F.updateDoc(F.doc(db, "users", uidNow(), "tracks", id), { name });
+  const deleteTrack = (id) => Promise.all([F.deleteDoc(F.doc(db, "users", uidNow(), "tracks", id)), F.deleteDoc(F.doc(db, "users", uidNow(), "trackpts", id))]);
+
+  async function deleteAccount(password) {
+    const u = state.user, uid = u.uid;
+    await F.reauthenticateWithCredential(u, F.EmailAuthProvider.credential(u.email, password));
+    for (const p of state.groupPins.filter((x) => x.ownerUid === uid)) {
+      await F.deleteDoc(mediaRef(p.id, "group")).catch(() => {});
+      await F.deleteDoc(pinRef(p.id, "group")).catch(() => {});
+    }
+    if (state.group) await leaveGroup().catch(() => {});
+    for (const name of ["pins", "tracks", "trackpts"]) {
+      const snap = await F.getDocs(F.collection(db, "users", uid, name));
+      for (const d of snap.docs) {
+        if (name === "pins") await F.deleteDoc(F.doc(d.ref, "media", "photo")).catch(() => {});
+        await F.deleteDoc(d.ref);
+      }
+    }
+    await F.deleteDoc(F.doc(db, "users", uid));
+    await F.deleteUser(u);
+  }
+
+  return {
+    state, init, on: (h) => handlers.add(h), signedIn: () => !!state.user, myName, uid: uidNow, cleanCode,
+    signUp, signIn, signOut, resetPassword, createGroup, joinGroup, leaveGroup, removeMember, setLocked,
+    sendLive, stopLive, savePin, deletePin, getPhoto, optimistic, listTracks, getTrack, saveTrack, renameTrack, deleteTrack, deleteAccount,
+  };
+})();
+
+const AUTH_ERRORS = {
+  "auth/invalid-credential": "That email and password don’t match.",
+  "auth/wrong-password": "That email and password don’t match.",
+  "auth/user-not-found": "That email and password don’t match.",
+  "auth/invalid-login-credentials": "That email and password don’t match.",
+  "auth/email-already-in-use": "An account with that email already exists. Sign in instead.",
+  "auth/weak-password": "Use a password with at least 6 characters.",
+  "auth/invalid-email": "That email address doesn’t look right.",
+  "auth/missing-password": "Enter your password.",
+  "auth/network-request-failed": "No connection. Try again when you have signal.",
+  "auth/too-many-requests": "Too many tries. Wait a minute and try again.",
+  "auth/requires-recent-login": "For safety, sign out and back in, then try again.",
+  "permission-denied": "You don’t have access to that. Ask the group owner.",
+};
+const friendlyError = (e) => AUTH_ERRORS[e && e.code] || (e && e.message) || "Something went wrong.";
+
 /* ================= pins ================= */
 const ICON = {
   plus: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>`,
@@ -759,21 +1008,46 @@ const PIN_TYPES = {
   note: { label: "Note", color: "#2F3B40", icon: '<path d="M3.5 4.5h9M3.5 8h9M3.5 11.5h5.5"/>' },
 };
 const WIND_TYPES = ["stand", "blind"];
+let localPins = [];
 let pins = [];
 const pinMarkers = new Map();
+const pinSigs = new Map();
 let openPinId = null;
 
+const MATE_COLORS = ["#2E7DD1", "#8E44AD", "#16A085", "#C0392B", "#B8860B", "#34495E", "#D63384", "#27AE60"];
+const mateColor = (id) => {
+  // members get colors in the order they joined, so a small group never repeats one
+  const members = (Cloud.state.group && Cloud.state.group.members) || [];
+  const i = members.indexOf(id);
+  if (i >= 0) return MATE_COLORS[i % MATE_COLORS.length];
+  let h = 0; for (const c of String(id)) h = (h * 31 + c.charCodeAt(0)) >>> 0;
+  return MATE_COLORS[h % MATE_COLORS.length];
+};
+const initials = (n) => String(n || "?").trim().split(/\s+/).slice(0, 2).map((w) => w[0]).join("").toUpperCase() || "?";
+const firstName = (n) => String(n || "").trim().split(/\s+/)[0] || "Hunter";
+const isOthers = (p) => p.src === "group" && p.ownerUid && p.ownerUid !== Cloud.uid();
+function canEdit(p) {
+  if (!p || p.src !== "group") return true;
+  const uid = Cloud.uid();
+  return !!uid && (p.ownerUid === uid || (Cloud.state.group && Cloud.state.group.ownerUid === uid));
+}
+
 const typeIcon = (t) => `<span class="ti" style="background:${t.color}"><svg viewBox="0 0 16 16" fill="none" stroke="#fff" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${t.icon}</svg></span>`;
-function pinIcon(type) {
-  const t = PIN_TYPES[type] || PIN_TYPES.note;
+function pinIcon(typeOrPin) {
+  const pin = typeof typeOrPin === "string" ? null : typeOrPin;
+  const t = PIN_TYPES[pin ? pin.type : typeOrPin] || PIN_TYPES.note;
+  const badge = pin && isOthers(pin)
+    ? `<circle cx="28" cy="7" r="7" fill="${mateColor(pin.ownerUid)}" stroke="#fff" stroke-width="1.6"/><text x="28" y="10.2" text-anchor="middle" font-size="8.5" font-weight="700" font-family="Barlow SC, sans-serif" fill="#fff">${esc(initials(pin.ownerName)[0])}</text>`
+    : "";
   return L.divIcon({
     className: "pin-icon",
-    html: `<svg width="34" height="44" viewBox="0 0 34 44" aria-hidden="true"><path d="M17 42.5s14-14.4 14-25.2A14 14 0 0 0 3 17.3C3 28.1 17 42.5 17 42.5z" fill="${t.color}" stroke="#fff" stroke-width="2.4"/><g transform="translate(8.6 8.8) scale(1.05)" fill="none" stroke="#fff" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">${t.icon}</g></svg>`,
-    iconSize: [34, 44], iconAnchor: [17, 42],
+    html: `<svg width="36" height="44" viewBox="0 0 36 44" aria-hidden="true"><path d="M17 42.5s14-14.4 14-25.2A14 14 0 0 0 3 17.3C3 28.1 17 42.5 17 42.5z" fill="${t.color}" stroke="#fff" stroke-width="2.4"/><g transform="translate(8.6 8.8) scale(1.05)" fill="none" stroke="#fff" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">${t.icon}</g>${badge}</svg>`,
+    iconSize: [36, 44], iconAnchor: [17, 42],
   });
 }
+const pinSig = (p) => `${p.lat},${p.lng},${p.type},${p.src},${p.ownerUid || ""},${Cloud.uid() || ""}`;
 function addPinMarker(pin) {
-  const m = L.marker([pin.lat, pin.lng], { icon: pinIcon(pin.type), title: pin.name || PIN_TYPES[pin.type]?.label || "Pin", riseOnHover: true });
+  const m = L.marker([pin.lat, pin.lng], { icon: pinIcon(pin), title: pinName(pin), riseOnHover: true });
   m.on("click", () => showPin(pin.id));
   m.on("drag", () => {
     if (editing && editing.pin.id === pin.id) {
@@ -784,27 +1058,52 @@ function addPinMarker(pin) {
   });
   m.addTo(map);
   pinMarkers.set(pin.id, m);
+  pinSigs.set(pin.id, pinSig(pin));
+}
+function refreshPins() {
+  const byId = new Map();
+  for (const p of [...localPins, ...Cloud.state.myPins, ...Cloud.state.groupPins]) byId.set(p.id, p);
+  pins = [...byId.values()];
+  const busy = editing && !editing.isNew ? editing.pin.id : null;
+  for (const p of pins) {
+    if (p.id === busy) continue;
+    const m = pinMarkers.get(p.id);
+    if (!m) { addPinMarker(p); continue; }
+    const sig = pinSig(p);
+    if (pinSigs.get(p.id) !== sig) { m.setLatLng([p.lat, p.lng]).setIcon(pinIcon(p)); pinSigs.set(p.id, sig); }
+  }
+  for (const [id, m] of pinMarkers) {
+    if (!byId.has(id) && id !== busy) { map.removeLayer(m); pinMarkers.delete(id); pinSigs.delete(id); }
+  }
+  if (sheetKind === "pins") renderPins();
 }
 async function loadPins() {
-  pins = (await DB.all("pins")) || [];
-  pins.forEach(addPinMarker);
+  localPins = ((await DB.all("pins")) || []).map((p) => ({ ...p, src: "local" }));
+  refreshPins();
 }
 const pinName = (p) => p.name || PIN_TYPES[p.type]?.label || "Pin";
+const pinWho = (p) => (p.src === "group" ? (p.ownerUid === Cloud.uid() ? "Shared by you" : `Shared by ${firstName(p.ownerName)}`) : p.src === "mine" ? "Private" : Cloud.signedIn() ? "On this phone only" : "");
+async function pinPhoto(pin) {
+  if (pin.src === "local") return DB.get("photos", pin.id).catch(() => null);
+  return Cloud.getPhoto(pin).catch(() => null);
+}
 
 function renderPins(open) {
   const loc = here();
   const filter = renderPins.filter || "all";
   const types = [...new Set(pins.map((p) => p.type))];
-  const list = pins.filter((p) => filter === "all" || p.type === filter)
+  const list = pins.filter((p) => filter === "all" || (filter === "mine" ? !isOthers(p) : filter === "group" ? p.src === "group" : p.type === filter))
     .map((p) => ({ p, d: distM(loc, p) }))
     .sort((a, b) => a.d - b.d);
+  const inGroup = !!Cloud.state.group;
   let html = `<div class="sec"><div class="actions" style="margin-top:0">
       <button class="btn primary" data-act="drop-pin">${ICON.plus} Pin at crosshair</button>
       ${me ? `<button class="btn" data-act="pin-me">Pin my location</button>` : ""}
     </div></div>`;
   if (pins.length) {
-    html += `<div class="filters" role="group" aria-label="Filter pins"><button class="${filter === "all" ? "on" : ""}" data-act="pin-filter" data-type="all">All ${pins.length}</button>${types.map((t) => `<button class="${filter === t ? "on" : ""}" data-act="pin-filter" data-type="${t}">${esc(PIN_TYPES[t]?.label || t)}</button>`).join("")}</div>`;
-    html += `<ul class="list">${list.map(({ p, d }) => `<li><button class="item" data-act="open-pin" data-id="${p.id}">${typeIcon(PIN_TYPES[p.type] || PIN_TYPES.note)}<span class="meta"><b>${esc(pinName(p))}</b><small>${esc(PIN_TYPES[p.type]?.label || "")}${p.notes ? " – " + esc(p.notes.slice(0, 60)) : ""}</small></span><span class="end">${fmtDist(d)}<br><small class="muted">${dir16(bearingDeg(loc, p))}</small></span></button></li>`).join("")}</ul>`;
+    const chip = (key, label) => `<button class="${filter === key ? "on" : ""}" data-act="pin-filter" data-type="${key}">${esc(label)}</button>`;
+    html += `<div class="filters" role="group" aria-label="Filter pins">${chip("all", `All ${pins.length}`)}${inGroup ? chip("group", "Group") + chip("mine", "Mine") : ""}${types.map((t) => chip(t, PIN_TYPES[t]?.label || t)).join("")}</div>`;
+    html += `<ul class="list">${list.map(({ p, d }) => `<li><button class="item" data-act="open-pin" data-id="${p.id}">${typeIcon(PIN_TYPES[p.type] || PIN_TYPES.note)}<span class="meta"><b>${esc(pinName(p))}</b><small>${esc([PIN_TYPES[p.type]?.label, inGroup ? pinWho(p) : ""].filter(Boolean).join(", "))}${p.notes ? " – " + esc(p.notes.slice(0, 50)) : ""}</small></span><span class="end">${fmtDist(d)}<br><small class="muted">${dir16(bearingDeg(loc, p))}</small></span></button></li>`).join("")}</ul>`;
     html += `<p class="note">Sorted by distance from ${loc.gps ? "you" : "the map center"}.</p>`;
   } else {
     html += `<p class="empty">No pins yet. Move the crosshair to a stand, camera or scrape and tap “Pin at crosshair”.</p>`;
@@ -818,12 +1117,12 @@ async function showPin(id) {
   if (!pin) return;
   openPinId = id;
   const t = PIN_TYPES[pin.type] || PIN_TYPES.note;
-  const photo = await DB.get("photos", id).catch(() => null);
   const from = me ? `${fmtDist(distM(me, pin))} ${dir16(bearingDeg(me, pin))} of you` : "";
   const winds = WIND_TYPES.includes(pin.type) && pin.winds && pin.winds.length ? pin.winds.join(", ") : "";
-  const html = `<div class="sec"><div class="row">${typeIcon(t)}<div class="grow"><div class="owner" style="margin:0">${esc(pinName(pin))}</div><div class="muted small">${esc(t.label)}, added ${fmtShort(new Date(pin.created))}</div></div></div>
+  const who = pinWho(pin);
+  const html = `<div class="sec"><div class="row">${typeIcon(t)}<div class="grow"><div class="owner" style="margin:0">${esc(pinName(pin))}</div><div class="muted small">${esc(t.label)}, added ${fmtShort(new Date(pin.created))}${who ? `. ${esc(who)}` : ""}</div></div></div>
     ${pin.notes ? `<p style="white-space:pre-wrap;margin:12px 0 0">${esc(pin.notes)}</p>` : ""}
-    ${photo ? `<img class="photo" alt="Photo for ${esc(pinName(pin))}" src="${URL.createObjectURL(photo)}">` : ""}
+    <div id="pinPhotoBox"></div>
     </div>
     <div class="sec"><dl class="kv">
       ${winds ? `<dt>Good winds</dt><dd>${esc(winds)}</dd>` : ""}
@@ -833,16 +1132,19 @@ async function showPin(id) {
     </dl>
     <div class="actions">
       <button class="btn primary" data-act="guide-pin" data-id="${id}">Guide me here</button>
-      <button class="btn" data-act="edit-pin" data-id="${id}">Edit</button>
+      ${canEdit(pin) ? `<button class="btn" data-act="edit-pin" data-id="${id}">Edit</button>` : ""}
       <a class="btn" href="https://www.google.com/maps/dir/?api=1&destination=${pin.lat},${pin.lng}" target="_blank" rel="noopener">Directions</a>
     </div></div>`;
   openSheet(t.label, html, { kind: "pin" });
   if (coneOn) drawCone();
+  const photo = await pinPhoto(pin);
+  const box = $("#pinPhotoBox");
+  if (photo && box && openPinId === id) box.innerHTML = `<img class="photo" alt="Photo for ${esc(pinName(pin))}" src="${URL.createObjectURL(photo)}">`;
 }
 
 let editing = null;
 function newPinAt(latlng, type = "stand") {
-  const pin = { id: uid(), type, name: "", notes: "", winds: [], lat: latlng.lat, lng: latlng.lng, created: Date.now(), updated: Date.now() };
+  const pin = { id: uid(), type, name: "", notes: "", winds: [], lat: latlng.lat, lng: latlng.lng, created: Date.now(), updated: Date.now(), shared: !!Cloud.state.group, src: null };
   const m = L.marker([pin.lat, pin.lng], { icon: pinIcon(type), draggable: true, zIndexOffset: 900 }).addTo(map);
   m.on("drag", () => { const ll = m.getLatLng(); if (editing) { editing.pin.lat = ll.lat; editing.pin.lng = ll.lng; const c = $("#editCoords"); if (c) c.textContent = fmtCoord(editing.pin); } });
   editing = { pin, isNew: true, temp: m, photo: undefined };
@@ -850,22 +1152,24 @@ function newPinAt(latlng, type = "stand") {
 }
 function editPin(id) {
   const pin = pins.find((p) => p.id === id);
-  if (!pin) return;
+  if (!pin || !canEdit(pin)) return;
   const m = pinMarkers.get(id);
-  m.dragging.enable();
+  if (m) m.dragging.enable();
   editing = { pin: { ...pin, winds: [...(pin.winds || [])] }, isNew: false, orig: { lat: pin.lat, lng: pin.lng }, photo: undefined };
   renderEditor();
 }
 async function renderEditor() {
   const e = editing;
   const p = e.pin;
-  const existingPhoto = e.photo !== undefined ? e.photo : e.isNew ? null : await DB.get("photos", p.id).catch(() => null);
+  const existingPhoto = e.photo !== undefined ? e.photo : e.isNew ? null : await pinPhoto(p);
+  const group = Cloud.state.group;
   const html = `<div class="sec">
     <div class="types" role="radiogroup" aria-label="Pin type">${Object.entries(PIN_TYPES).map(([k, t]) => `<button role="radio" aria-checked="${p.type === k}" class="${p.type === k ? "on" : ""}" data-act="pin-type" data-type="${k}">${typeIcon(t)}${esc(t.label)}</button>`).join("")}</div>
     <label class="f" for="pinName">Name</label>
     <input class="input" id="pinName" maxlength="60" placeholder="${esc((PIN_TYPES[p.type] || PIN_TYPES.note).label)}" value="${esc(p.name)}" autocomplete="off">
     <label class="f" for="pinNotes">Notes</label>
     <textarea class="input" id="pinNotes" placeholder="Height, access route, what you saw">${esc(p.notes)}</textarea>
+    ${group && (e.isNew || p.ownerUid === Cloud.uid() || !p.ownerUid) ? `<button class="toggle" data-act="pin-share" aria-pressed="${!!p.shared}"><span class="t-text">Share with ${esc(group.name)}<small>${p.shared ? "Everyone in your group sees this pin" : "Only you see this pin"}</small></span><span class="switch"></span></button>` : ""}
     ${WIND_TYPES.includes(p.type) ? `<label class="f">Winds this spot works in</label><div class="compass8" role="group" aria-label="Good winds">${DIRS8.map((d) => `<button aria-pressed="${p.winds.includes(d)}" class="${p.winds.includes(d) ? "on" : ""}" data-act="wind-toggle" data-dir="${d}">${d}</button>`).join("")}</div>` : ""}
     <label class="f">Photo</label>
     ${existingPhoto ? `<img class="photo" alt="Pin photo" src="${URL.createObjectURL(existingPhoto)}">` : ""}
@@ -879,17 +1183,14 @@ async function renderEditor() {
       <button class="btn" data-act="close-sheet">Cancel</button>
       ${!e.isNew ? `<button class="btn danger" data-act="pin-delete">Delete</button>` : ""}
     </div></div>`;
-  const keepName = $("#pinName") ? $("#pinName").value : null;
-  const keepNotes = $("#pinNotes") ? $("#pinNotes").value : null;
   const wasEditor = sheetKind === "edit-pin";
   if (wasEditor) $("#sheetBody").innerHTML = html;
   else openSheet(e.isNew ? "New pin" : "Edit pin", html, { kind: "edit-pin", tall: true });
-  if (wasEditor && keepName !== null) { $("#pinName").value = keepName; $("#pinNotes").value = keepNotes; }
   $("#pinPhoto").addEventListener("change", async (ev) => {
     const f = ev.target.files && ev.target.files[0];
     if (!f) return;
-    editing.pin.name = $("#pinName").value; editing.pin.notes = $("#pinNotes").value;
-    try { editing.photo = await shrinkImage(f); } catch (err) { toast("That photo couldn't be read"); }
+    readEditorFields();
+    try { editing.photo = await shrinkImage(f); } catch (err) { toast("That photo couldn’t be read"); }
     renderEditor();
   });
 }
@@ -911,40 +1212,49 @@ function cancelEdit() {
 async function savePin() {
   readEditorFields();
   const e = editing;
-  const pin = { ...e.pin, updated: Date.now() };
+  let pin = { ...e.pin, updated: Date.now() };
   if (!WIND_TYPES.includes(pin.type)) pin.winds = [];
-  await DB.put("pins", pin);
-  if (e.photo === null) await DB.del("photos", pin.id);
-  else if (e.photo) await DB.put("photos", e.photo, pin.id);
-  if (e.isNew) { map.removeLayer(e.temp); pins.push(pin); addPinMarker(pin); }
-  else {
-    pins = pins.map((p) => (p.id === pin.id ? pin : p));
-    const m = pinMarkers.get(pin.id);
-    m.dragging.disable();
-    m.setIcon(pinIcon(pin.type));
-    m.off("click").on("click", () => showPin(pin.id));
+  const prevSrc = e.isNew ? null : pin.src;
+  let photo = e.photo;
+  if (Cloud.signedIn()) {
+    if (prevSrc === "local") {
+      // editing a phone-only pin while signed in moves it into your account
+      if (photo === undefined) photo = (await DB.get("photos", pin.id).catch(() => null)) || undefined;
+      await DB.del("pins", pin.id); await DB.del("photos", pin.id);
+      localPins = localPins.filter((p) => p.id !== pin.id);
+    }
+    pin = await Cloud.savePin(pin, photo, prevSrc === "local" ? null : prevSrc);
+  } else {
+    const { src, ...rest } = pin;
+    await DB.put("pins", rest);
+    if (photo === null) await DB.del("photos", pin.id);
+    else if (photo) await DB.put("photos", photo, pin.id);
+    pin = { ...rest, src: "local" };
+    localPins = [...localPins.filter((p) => p.id !== pin.id), pin];
   }
+  if (e.isNew) map.removeLayer(e.temp);
+  else { const m = pinMarkers.get(pin.id); if (m) m.dragging.disable(); }
   editing = null;
-  sheetKind = "pin-saved"; // skip cancel cleanup
+  refreshPins();
+  sheetKind = "pin-saved"; // skip the cancel cleanup
   toast("Pin saved");
   showPin(pin.id);
 }
 async function deletePin() {
-  const id = editing.pin.id;
-  if (!confirm(`Delete “${pinName(editing.pin)}”?`)) return;
-  await DB.del("pins", id);
-  await DB.del("photos", id);
-  const m = pinMarkers.get(id);
-  if (m) map.removeLayer(m);
-  pinMarkers.delete(id);
-  pins = pins.filter((p) => p.id !== id);
+  const pin = pins.find((p) => p.id === editing.pin.id) || editing.pin;
+  if (!confirm(`Delete “${pinName(pin)}”?${pin.src === "group" ? " It disappears for everyone in your group." : ""}`)) return;
+  if (pin.src === "local") {
+    await DB.del("pins", pin.id); await DB.del("photos", pin.id);
+    localPins = localPins.filter((p) => p.id !== pin.id);
+  } else Cloud.deletePin(pin);
   editing = null;
+  refreshPins();
   sheetKind = "pin-deleted";
-  if (guide && guide.id === id) stopGuide();
+  if (guide && guide.id === pin.id) stopGuide();
   toast("Pin deleted");
   renderPins(true);
 }
-async function shrinkImage(file, max = 1280) {
+async function shrinkImage(file, max = 1280, quality = 0.82) {
   const url = URL.createObjectURL(file);
   try {
     const img = await new Promise((res, rej) => { const i = new Image(); i.onload = () => res(i); i.onerror = rej; i.src = url; });
@@ -953,10 +1263,177 @@ async function shrinkImage(file, max = 1280) {
     c.width = Math.round(img.naturalWidth * s);
     c.height = Math.round(img.naturalHeight * s);
     c.getContext("2d").drawImage(img, 0, 0, c.width, c.height);
-    return await new Promise((res) => c.toBlob(res, "image/jpeg", 0.82));
+    return await new Promise((res) => c.toBlob(res, "image/jpeg", quality));
   } finally {
     URL.revokeObjectURL(url);
   }
+}
+
+/* ================= group: members, live locations ================= */
+const share = { on: false, until: 0, lastSent: 0, lastPos: null };
+try { Object.assign(share, JSON.parse(localStorage.getItem("greylock.share") || "{}")); } catch (e) { /* ignore */ }
+const saveShare = () => { try { localStorage.setItem("greylock.share", JSON.stringify({ on: share.on, until: share.until })); } catch (e) { /* ignore */ } };
+function shareStopTime() {
+  const now = Date.now();
+  const end = legalTimes(new Date(), here()).end.getTime() + 3600e3;
+  return now < end ? end : now + 3 * 3600e3; // after dark, keep sharing three hours for the walk out
+}
+function setSharing(on) {
+  if (on && !Cloud.state.group) { toast("Join a group first"); return; }
+  share.on = on;
+  share.until = on ? shareStopTime() : 0;
+  share.lastSent = 0;
+  saveShare();
+  if (on) { if (me) maybeSendLive(true); else toast("Sharing starts once GPS finds you"); }
+  else Cloud.stopLive().catch(() => {});
+  renderChips();
+  if (sheetKind === "group") renderGroup();
+}
+function maybeSendLive(force) {
+  if (!share.on || !me || !Cloud.state.group) return;
+  if (Date.now() > share.until) { setSharing(false); toast("Location sharing turned off for the day"); return; }
+  const since = Date.now() - share.lastSent;
+  const moved = share.lastPos ? distM(share.lastPos, me) : Infinity;
+  if (force || since > 60000 || (since > 15000 && moved > 25)) {
+    share.lastSent = Date.now();
+    share.lastPos = { lat: me.lat, lng: me.lng };
+    Cloud.sendLive(me, heading).catch(() => {});
+  }
+}
+
+const teamMarkers = new Map();
+const liveAge = (l) => Date.now() - (l.ct || 0);
+const ageText = (ms) => (ms < 90e3 ? "now" : ms < 3600e3 ? `${Math.round(ms / 60e3)}m` : `${Math.floor(ms / 3600e3)}h`);
+const activeMates = () => Cloud.state.live.filter((l) => l.sharing && l.uid !== Cloud.uid() && l.lat != null && liveAge(l) < 3 * 3600e3);
+function mateIcon(l) {
+  const stale = liveAge(l) > 10 * 60e3;
+  return L.divIcon({
+    className: "",
+    html: `<div class="mate${stale ? " stale" : ""}"><span style="background:${mateColor(l.uid)}">${esc(initials(l.name))}</span><b>${esc(firstName(l.name))} ${ageText(liveAge(l))}</b></div>`,
+    iconSize: [34, 34], iconAnchor: [17, 17],
+  });
+}
+function renderTeam() {
+  const live = activeMates();
+  const seen = new Set();
+  for (const l of live) {
+    seen.add(l.uid);
+    let m = teamMarkers.get(l.uid);
+    if (!m) {
+      m = L.marker([l.lat, l.lng], { icon: mateIcon(l), zIndexOffset: 800, keyboard: false });
+      m.on("click", () => showMate(l.uid));
+      m.addTo(map);
+      teamMarkers.set(l.uid, m);
+    } else m.setLatLng([l.lat, l.lng]).setIcon(mateIcon(l));
+    if (guide && guide.uid === l.uid) { guide.lat = l.lat; guide.lng = l.lng; updateGuide(); }
+  }
+  for (const [id, m] of teamMarkers) if (!seen.has(id)) { map.removeLayer(m); teamMarkers.delete(id); }
+  const btn = $("#btnGroup");
+  if (btn) btn.dataset.count = live.length ? String(live.length) : "";
+  if (sheetKind === "group") renderGroup();
+  if (sheetKind === "mate" && showMate.uid) showMate(showMate.uid, true);
+}
+function showMate(mateUid, refresh) {
+  const l = Cloud.state.live.find((x) => x.uid === mateUid);
+  if (!l) return;
+  showMate.uid = mateUid;
+  const from = me ? `${fmtDist(distM(me, l))} ${dir16(bearingDeg(me, l))} of you` : "";
+  const html = `<div class="sec"><div class="row"><span class="ti" style="background:${mateColor(l.uid)};width:44px;height:44px;border-radius:50%;display:grid;place-items:center;color:#fff;font:700 18px var(--font-data)">${esc(initials(l.name))}</span>
+      <div class="grow"><div class="owner" style="margin:0">${esc(l.name || "Hunter")}</div><div class="muted small">${l.sharing ? `Updated ${ageText(liveAge(l)) === "now" ? "just now" : ageText(liveAge(l)) + " ago"}` : "Stopped sharing"}</div></div></div>
+    <dl class="kv">${from ? `<dt>Distance</dt><dd>${from}</dd>` : ""}<dt>GPS accuracy</dt><dd>${l.acc ? `about ${Math.round(l.acc * 1.09361)} yd` : "–"}</dd></dl>
+    <div class="actions"><button class="btn primary" data-act="guide-mate" data-uid="${l.uid}">Guide me to ${esc(firstName(l.name))}</button></div>
+    <p class="note">Their dot only updates while Greylock is open on their phone.</p></div>`;
+  if (refresh && sheetKind === "mate") $("#sheetBody").innerHTML = html;
+  else openSheet(firstName(l.name), html, { kind: "mate" });
+}
+
+async function moveLocalToAccount() {
+  let n = 0, m = 0;
+  for (const p of [...localPins]) {
+    const photo = await DB.get("photos", p.id).catch(() => null);
+    await Cloud.savePin({ ...p, shared: false, src: null }, photo || undefined, null);
+    await DB.del("pins", p.id); await DB.del("photos", p.id);
+    n++;
+  }
+  localPins = [];
+  for (const t of (await DB.all("tracks")) || []) {
+    if (rec && t.id === rec.id) continue;
+    Cloud.saveTrack(t).catch(() => {});
+    await DB.del("tracks", t.id);
+    m++;
+  }
+  refreshPins();
+  toast(`Moved ${n} pin${n === 1 ? "" : "s"} and ${m} track${m === 1 ? "" : "s"} to your account`);
+  renderGroup();
+}
+
+function renderGroup(open) {
+  const s = Cloud.state;
+  let html = "";
+  if (!s.enabled) {
+    html = `<div class="sec"><p style="margin-top:0">Accounts and group sharing aren’t set up yet.</p><p class="note">Add your Firebase settings to <b>firebase-config.js</b> as described in the README, upload it, and reopen the app.</p></div>`;
+  } else if (!s.ready) {
+    html = `<div class="sec"><p class="muted">Connecting…</p></div>`;
+  } else if (!s.user) {
+    const mode = renderGroup.mode || "signin";
+    html = `<div class="sec"><p class="note" style="margin-top:0">Sign in to share pins with your hunting group and see where everyone is while you hunt.</p>
+      <div class="seg" role="group" aria-label="Sign in or create account"><button class="${mode === "signin" ? "on" : ""}" data-act="auth-mode" data-mode="signin">Sign in</button><button class="${mode === "signup" ? "on" : ""}" data-act="auth-mode" data-mode="signup">Create account</button></div>
+      ${mode === "signup" ? `<label class="f" for="authName">Your name, as your group sees it</label><input class="input" id="authName" autocomplete="name" maxlength="40">` : ""}
+      <label class="f" for="authEmail">Email</label><input class="input" id="authEmail" type="email" autocomplete="email" inputmode="email">
+      <label class="f" for="authPw">Password</label><input class="input" id="authPw" type="password" autocomplete="${mode === "signup" ? "new-password" : "current-password"}" minlength="6">
+      <div class="warn" id="authErr" hidden></div>
+      <div class="actions"><button class="btn primary" data-act="auth-submit">${mode === "signup" ? "Create account" : "Sign in"}</button>${mode === "signin" ? `<button class="btn" data-act="auth-reset">Forgot password</button>` : ""}</div></div>`;
+  } else {
+    const me_ = s.user, g = s.group;
+    html += `<div class="sec"><p style="margin:0">Signed in as <b>${esc(Cloud.myName())}</b></p><p class="note" style="margin-top:2px">${esc(me_.email || "")}</p></div>`;
+    if (!g) {
+      html += `<div class="sec"><h3>Join your group</h3><p class="note" style="margin-top:0">Enter the invite code someone in your group sent you.</p>
+        <div class="row"><input class="input grow" id="joinCode" placeholder="ABCD-1234" autocapitalize="characters" autocomplete="off" maxlength="9" style="text-transform:uppercase;font-family:var(--font-data);font-size:20px;letter-spacing:.08em"><button class="btn primary" data-act="group-join">Join</button></div></div>
+        <div class="sec"><h3>Or start a new group</h3><div class="row"><input class="input grow" id="groupName" placeholder="Group name" maxlength="40"><button class="btn" data-act="group-create">Create</button></div></div>
+        <div class="warn" id="groupErr" hidden></div>`;
+    } else {
+      const isOwner = g.ownerUid === me_.uid;
+      const code = `${g.id.slice(0, 4)}-${g.id.slice(4)}`;
+      const live = new Map(s.live.map((l) => [l.uid, l]));
+      const members = (g.members || []).map((u) => ({ uid: u, name: (g.names || {})[u] || (live.get(u) || {}).name || "Member", l: live.get(u) }));
+      html += `<div class="sec"><div class="today-card"><h3>${esc(g.name)}</h3><div class="muted small" style="color:var(--strip-ink-2)">Invite code</div>
+          <div class="code">${esc(code)}</div>
+          <div class="actions" style="margin-top:10px"><button class="btn" data-act="copy" data-text="${esc(code)}">Copy code</button>${navigator.share ? `<button class="btn" data-act="group-share">Send invite</button>` : ""}</div>
+          ${g.locked ? `<p class="small" style="margin:8px 0 0">Locked. New members can’t join.</p>` : ""}</div></div>
+        <div class="sec"><button class="toggle" data-act="share-toggle" aria-pressed="${share.on}"><span class="t-text">Share my location<small>${share.on ? `Your group sees you until ${fmtTime(new Date(share.until))}. Updates only while Greylock is open.` : "Off. Your group can’t see where you are."}</small></span><span class="switch"></span></button></div>
+        <div class="sec"><h3>Members</h3><ul class="list">${members.map((mb) => {
+          const sharing = mb.l && mb.l.sharing && liveAge(mb.l) < 3 * 3600e3 && mb.uid !== me_.uid;
+          const status = mb.uid === me_.uid ? (share.on ? "You, sharing" : "You") : sharing ? `Sharing, ${ageText(liveAge(mb.l)) === "now" ? "just now" : ageText(liveAge(mb.l)) + " ago"}${me ? `, ${fmtDist(distM(me, mb.l))} ${dir16(bearingDeg(me, mb.l))}` : ""}` : "Not sharing";
+          return `<li><div class="item"><span class="ti" style="background:${mateColor(mb.uid)};font:700 14px var(--font-data)">${esc(initials(mb.name))}</span><span class="meta"><b>${esc(mb.name)}${mb.uid === g.ownerUid ? " <small class='muted'>owner</small>" : ""}</b><small>${esc(status)}</small></span>
+            <span class="row">${sharing ? `<button class="btn" style="min-height:40px;padding:0 12px" data-act="mate-go" data-uid="${mb.uid}">Find</button>` : ""}${isOwner && mb.uid !== me_.uid ? `<button class="btn danger" style="min-height:40px;padding:0 12px" data-act="group-remove" data-uid="${mb.uid}" aria-label="Remove ${esc(mb.name)}">Remove</button>` : ""}</span></div></li>`;
+        }).join("")}</ul>
+        ${isOwner ? `<button class="toggle" data-act="group-lock" aria-pressed="${!!g.locked}"><span class="t-text">Lock the group<small>Stops anyone new from joining with the code</small></span><span class="switch"></span></button>` : ""}</div>`;
+    }
+    const localCount = localPins.length;
+    if (localCount) {
+      html += `<div class="sec"><h3>Pins on this phone</h3><p class="note" style="margin-top:0">${localCount} pin${localCount === 1 ? " is" : "s are"} saved only on this phone. Move them into your account so they sync. They stay private until you share them.</p><div class="actions"><button class="btn" data-act="move-local">Move to my account</button></div></div>`;
+    }
+    html += `<div class="sec"><div class="actions" style="margin-top:0"><button class="btn" data-act="auth-signout">Sign out</button>${g ? `<button class="btn danger" data-act="group-leave">${g.ownerUid === me_.uid ? "Delete group" : "Leave group"}</button>` : ""}<button class="btn danger" data-act="account-delete">Delete account</button></div></div>`;
+  }
+  if (open || sheetKind !== "group") openSheet("Group", html, { kind: "group", tall: true });
+  else {
+    // keep typed values when live updates re-render the panel
+    const keep = ["authName", "authEmail", "authPw", "joinCode", "groupName"].map((idv) => [idv, $("#" + idv)?.value]);
+    $("#sheetBody").innerHTML = html;
+    keep.forEach(([idv, v]) => { const el = $("#" + idv); if (el && v) el.value = v; });
+  }
+}
+function showErr(id, msg) { const el = $("#" + id); if (el) { el.textContent = msg; el.hidden = false; } else toast(msg, 4000); }
+async function authSubmit() {
+  const mode = renderGroup.mode || "signin";
+  const email = $("#authEmail").value.trim(), pw = $("#authPw").value;
+  const name = mode === "signup" ? $("#authName").value.trim() : "";
+  if (mode === "signup" && !name) return showErr("authErr", "Enter your name so your group knows who you are.");
+  if (!email || !pw) return showErr("authErr", "Enter your email and password.");
+  try {
+    if (mode === "signup") await Cloud.signUp(name, email, pw); else await Cloud.signIn(email, pw);
+    toast(mode === "signup" ? "Account created" : "Signed in");
+  } catch (e) { showErr("authErr", friendlyError(e)); }
 }
 
 /* ================= guide-to ================= */
@@ -985,8 +1462,11 @@ function updateGuide() {
 }
 
 /* ================= tracks ================= */
+// Recording always writes to the phone first so a crash or dead battery loses nothing.
+// When you stop, the track moves to your account if you're signed in.
 let rec = null, recLine = null, recTicker = null, wakeLock = null;
 const shownTracks = new Map();
+let trackList = [];
 async function keepAwake(on) {
   try {
     if (on && "wakeLock" in navigator) { wakeLock = await navigator.wakeLock.request("screen"); }
@@ -998,6 +1478,7 @@ document.addEventListener("visibilitychange", () => {
   if (rec && prefs.keepAwake) keepAwake(true);
   updateStatus();
   refreshWeather();
+  maybeSendLive(true);
 });
 async function startRec() {
   rec = { id: uid(), name: `Track ${fmtDay(new Date())}`, start: Date.now(), end: null, points: [], dist: 0 };
@@ -1026,25 +1507,48 @@ async function stopRec() {
   if (!rec) return;
   rec.end = Date.now();
   const done = { ...rec };
-  await DB.put("tracks", done);
   clearInterval(recTicker);
   map.removeLayer(recLine);
   recLine = null;
   rec = null;
   keepAwake(false);
+  if (Cloud.signedIn()) {
+    Cloud.saveTrack(done).catch(() => toast("Track saved on this phone. It will sync later.", 3600));
+    await DB.del("tracks", done.id);
+    trackCache.set(done.id, { ...done, src: "cloud" });
+  } else {
+    await DB.put("tracks", done);
+  }
   if (done.points.length > 1) toggleTrack(done.id, true);
   renderChips();
   toast(`Saved ${fmtDist(done.dist)} track`);
 }
+const trackCache = new Map();
+async function loadTrack(id) {
+  if (trackCache.has(id)) return trackCache.get(id);
+  let t = await DB.get("tracks", id);
+  if (t) t = { ...t, src: "local" };
+  else if (Cloud.signedIn()) t = await Cloud.getTrack(id).catch(() => null);
+  if (t) trackCache.set(id, t);
+  return t;
+}
+async function listAllTracks() {
+  const local = ((await DB.all("tracks")) || []).filter((t) => !rec || t.id !== rec.id).map((t) => ({ ...t, src: "local" }));
+  let cloud = [];
+  if (Cloud.signedIn()) { try { cloud = await Cloud.listTracks(); } catch (e) { cloud = []; } }
+  const byId = new Map();
+  [...local, ...cloud].forEach((t) => byId.set(t.id, t));
+  return [...byId.values()].sort((a, b) => b.start - a.start);
+}
 async function toggleTrack(id, on) {
   if (!on) { const l = shownTracks.get(id); if (l) map.removeLayer(l); shownTracks.delete(id); return; }
-  const t = await DB.get("tracks", id);
-  if (!t || t.points.length < 2) return;
+  const t = await loadTrack(id);
+  if (!t || !t.points || t.points.length < 2) return;
   const l = L.polyline(t.points.map((p) => [p[0], p[1]]), { color: "#E8A33D", weight: 4, opacity: 0.9, dashArray: "1 7", lineCap: "round", interactive: false }).addTo(map);
   shownTracks.set(id, l);
 }
 async function renderTracks(open) {
-  const tracks = ((await DB.all("tracks")) || []).filter((t) => !rec || t.id !== rec.id).sort((a, b) => b.start - a.start);
+  trackList = await listAllTracks();
   let html = `<div class="sec">`;
   if (rec) {
     html += `<div class="row"><div class="grow"><div class="big">${fmtDist(rec.dist)}</div><div class="muted">${fmtClock(Date.now() - rec.start)} recording, ${rec.points.length} points</div></div>
@@ -1054,13 +1558,14 @@ async function renderTracks(open) {
   }
   html += `<button class="toggle" data-act="awake-toggle" aria-pressed="${prefs.keepAwake}"><span class="t-text">Keep screen on while recording<small>Phones pause GPS when the screen locks, so a locked phone leaves gaps</small></span><span class="switch"></span></button></div>`;
   html += `<div class="sec"><h3>Saved tracks</h3>`;
-  if (tracks.length) {
-    html += `<ul class="list">${tracks.map((t) => {
+  if (trackList.length) {
+    html += `<ul class="list">${trackList.map((t) => {
       const shown = shownTracks.has(t.id);
-      const last = t.points.length ? t.points[t.points.length - 1][3] : null;
+      const last = t.points && t.points.length ? t.points[t.points.length - 1][3] : null;
       const dur = (t.end || last || t.start) - t.start;
       const menu = renderTracks.menu === t.id;
-      return `<li><div class="item"><span class="meta"><b>${esc(t.name)}</b><small>${fmtDist(t.dist)}, ${fmtDur(dur)}, ${esc(fmtShort(new Date(t.start)))}</small></span>
+      const where = Cloud.signedIn() && t.src === "local" ? ", on this phone only" : "";
+      return `<li><div class="item"><span class="meta"><b>${esc(t.name)}</b><small>${fmtDist(t.dist)}, ${fmtDur(dur)}, ${esc(fmtShort(new Date(t.start)))}${where}</small></span>
         <span class="row"><button class="btn" style="min-height:40px;padding:0 12px" data-act="track-toggle" data-id="${t.id}" aria-pressed="${shown}">${shown ? "Hide" : "Show"}</button>
         <button class="btn" style="min-height:40px;padding:0 12px" data-act="track-more" data-id="${t.id}" aria-expanded="${menu}" aria-label="More actions for ${esc(t.name)}">More</button></span></div>
         ${menu ? `<div class="actions" style="margin:0 0 12px"><button class="btn" data-act="track-zoom" data-id="${t.id}">Zoom to track</button><button class="btn" data-act="track-gpx" data-id="${t.id}">Export GPX</button><button class="btn" data-act="track-rename" data-id="${t.id}">Rename</button><button class="btn danger" data-act="track-delete" data-id="${t.id}">Delete</button></div>` : ""}</li>`;
@@ -1071,10 +1576,10 @@ async function renderTracks(open) {
   else $("#sheetBody").innerHTML = html;
 }
 async function trackAction(act, id) {
-  const t = await DB.get("tracks", id);
-  if (!t) return;
+  const t = await loadTrack(id);
+  if (!t) return toast("That track couldn’t be loaded");
   if (act === "track-zoom") {
-    if (t.points.length < 2) return toast("This track has no points yet");
+    if (!t.points || t.points.length < 2) return toast("This track has no points yet");
     if (!shownTracks.has(id)) await toggleTrack(id, true);
     closeSheet();
     map.fitBounds(L.latLngBounds(t.points.map((p) => [p[0], p[1]])).pad(0.2));
@@ -1083,12 +1588,19 @@ async function trackAction(act, id) {
   if (act === "track-gpx") return saveFile(`${t.name.replace(/[^\w-]+/g, "_")}.gpx`, gpx([], [t]), "application/gpx+xml");
   if (act === "track-rename") {
     const n = prompt("Track name", t.name);
-    if (n && n.trim()) { t.name = n.trim().slice(0, 60); await DB.put("tracks", t); }
+    if (n && n.trim()) {
+      t.name = n.trim().slice(0, 60);
+      trackCache.set(id, t);
+      if (t.src === "local") { const { src, ...rest } = t; await DB.put("tracks", rest); }
+      else Cloud.renameTrack(id, t.name).catch(() => {});
+    }
   }
   if (act === "track-delete") {
     if (!confirm(`Delete “${t.name}”?`)) return;
     await toggleTrack(id, false);
-    await DB.del("tracks", id);
+    if (t.src === "local") await DB.del("tracks", id);
+    else Cloud.deleteTrack(id).catch(() => {});
+    trackCache.delete(id);
     renderTracks.menu = null;
     toast("Track deleted");
   }
@@ -1571,15 +2083,21 @@ async function saveFile(name, text, type) {
   setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 3000);
 }
 const blobToDataURL = (b) => new Promise((res) => { const r = new FileReader(); r.onload = () => res(r.result); r.readAsDataURL(b); });
+async function fullTracks() {
+  const out = [];
+  for (const t of await listAllTracks()) { const full = await loadTrack(t.id); if (full) out.push(full); }
+  return out;
+}
+const mineOnly = () => pins.filter((p) => !isOthers(p));
 async function exportGpx() {
-  const tracks = (await DB.all("tracks")) || [];
-  await saveFile(`greylock-${ymd(new Date())}.gpx`, gpx(pins, tracks), "application/gpx+xml");
+  await saveFile(`greylock-${ymd(new Date())}.gpx`, gpx(mineOnly(), await fullTracks()), "application/gpx+xml");
 }
 async function backup() {
-  const tracks = (await DB.all("tracks")) || [];
+  const tracks = (await fullTracks()).map(({ src, ...t }) => t);
   const photos = {};
-  for (const p of pins) { const b = await DB.get("photos", p.id); if (b) photos[p.id] = await blobToDataURL(b); }
-  const data = { app: "greylock", version: 1, exported: new Date().toISOString(), pins, tracks, photos };
+  const list = mineOnly();
+  for (const p of list) { const b = await pinPhoto(p); if (b) photos[p.id] = await blobToDataURL(b); }
+  const data = { app: "greylock", version: 1, exported: new Date().toISOString(), pins: list.map(({ src, ...p }) => p), tracks, photos };
   await saveFile(`greylock-backup-${ymd(new Date())}.json`, JSON.stringify(data), "application/json");
 }
 async function restore(file) {
@@ -1589,13 +2107,12 @@ async function restore(file) {
     if (data.app !== "greylock") throw new Error("not a Greylock backup");
     let n = 0;
     for (const p of data.pins || []) {
-      await DB.put("pins", p);
+      const { src, ...clean } = p;
+      await DB.put("pins", clean);
       if (data.photos && data.photos[p.id]) await DB.put("photos", await (await fetch(data.photos[p.id])).blob(), p.id);
       n++;
     }
     for (const t of data.tracks || []) await DB.put("tracks", t);
-    pinMarkers.forEach((m) => map.removeLayer(m));
-    pinMarkers.clear();
     await loadPins();
     toast(`Restored ${n} pins and ${(data.tracks || []).length} tracks`);
   } catch (e) {
@@ -1636,7 +2153,7 @@ document.addEventListener("click", async (e) => {
     case "pin-type":
       readEditorFields();
       editing.pin.type = el.dataset.type;
-      (editing.isNew ? editing.temp : pinMarkers.get(editing.pin.id)).setIcon(pinIcon(editing.pin.type));
+      (editing.isNew ? editing.temp : pinMarkers.get(editing.pin.id)).setIcon(pinIcon({ ...editing.pin }));
       return renderEditor();
     case "wind-toggle": {
       const d = el.dataset.dir, w = editing.pin.winds;
@@ -1648,7 +2165,69 @@ document.addEventListener("click", async (e) => {
       return;
     }
     case "photo-remove": readEditorFields(); editing.photo = null; return renderEditor();
+    case "pin-share":
+      readEditorFields();
+      editing.pin.shared = !editing.pin.shared;
+      return renderEditor();
     case "pin-save": return savePin();
+    case "auth-mode": renderGroup.mode = el.dataset.mode; return renderGroup();
+    case "auth-submit": return authSubmit();
+    case "auth-reset": {
+      const email = ($("#authEmail") || {}).value || "";
+      if (!email.trim()) return showErr("authErr", "Enter your email first, then tap Forgot password.");
+      try { await Cloud.resetPassword(email.trim()); toast("Check your email for a reset link", 3600); } catch (err) { showErr("authErr", friendlyError(err)); }
+      return;
+    }
+    case "auth-signout":
+      if (share.on) setSharing(false);
+      await Cloud.signOut();
+      return toast("Signed out");
+    case "group-create": {
+      try { await Cloud.createGroup(($("#groupName").value || "").trim()); toast("Group created. Send the invite code to your crew."); }
+      catch (err) { showErr("groupErr", friendlyError(err)); }
+      return;
+    }
+    case "group-join": {
+      try { await Cloud.joinGroup($("#joinCode").value); toast("You’re in"); }
+      catch (err) { showErr("groupErr", friendlyError(err)); }
+      return;
+    }
+    case "group-share": {
+      const g = Cloud.state.group;
+      if (!g) return;
+      const code = `${g.id.slice(0, 4)}-${g.id.slice(4)}`;
+      try { await navigator.share({ title: "Join my Greylock group", text: `Join “${g.name}” in Greylock with invite code ${code}: ${location.origin}${location.pathname}` }); } catch (err) { /* closed */ }
+      return;
+    }
+    case "group-remove": {
+      const g = Cloud.state.group, who = (g.names || {})[el.dataset.uid] || "this member";
+      if (!confirm(`Remove ${who} from the group?`)) return;
+      try { await Cloud.removeMember(el.dataset.uid); } catch (err) { toast(friendlyError(err), 4000); }
+      return;
+    }
+    case "group-lock":
+      try { await Cloud.setLocked(!Cloud.state.group.locked); } catch (err) { toast(friendlyError(err), 4000); }
+      return;
+    case "group-leave": {
+      const g = Cloud.state.group;
+      const owner = g.ownerUid === Cloud.uid();
+      if (!confirm(owner ? `Delete “${g.name}” for everyone? Shared pins in it will be lost.` : `Leave “${g.name}”? You’ll stop seeing its shared pins.`)) return;
+      if (share.on) setSharing(false);
+      try { await Cloud.leaveGroup(); toast(owner ? "Group deleted" : "You left the group"); } catch (err) { toast(friendlyError(err), 4000); }
+      return;
+    }
+    case "share-toggle": return setSharing(!share.on);
+    case "mate-go": { const l = Cloud.state.live.find((x) => x.uid === el.dataset.uid); if (l) { closeSheet(); map.setView([l.lat, l.lng], Math.max(map.getZoom(), 16)); showMate(l.uid); } return; }
+    case "guide-mate": { const l = Cloud.state.live.find((x) => x.uid === el.dataset.uid); if (l) startGuide({ lat: l.lat, lng: l.lng, name: firstName(l.name), uid: l.uid }); return; }
+    case "move-local": return moveLocalToAccount();
+    case "account-delete": {
+      if (!confirm("Delete your account? Your private pins, tracks and shared pins are removed for good.")) return;
+      const pw = prompt("Enter your password to confirm");
+      if (!pw) return;
+      try { if (share.on) setSharing(false); await Cloud.deleteAccount(pw); toast("Account deleted"); }
+      catch (err) { toast(friendlyError(err), 4200); }
+      return;
+    }
     case "pin-delete": return deletePin();
     case "rec-start": await startRec(); return renderTracks();
     case "rec-stop": await stopRec(); return renderTracks();
@@ -1712,6 +2291,22 @@ document.addEventListener("keydown", (e) => { if (e.key === "Escape" && sheetKin
   renderChips();
   startGPS();
   try { await loadPins(); } catch (e) { toast("Couldn't open saved pins on this device"); }
+  let lastGroupId = null;
+  Cloud.on((what) => {
+    if (what === "pins") refreshPins();
+    if (what === "live") renderTeam();
+    if (what === "auth") {
+      refreshPins();
+      renderChips();
+      if (share.on && !Cloud.state.group && Cloud.state.ready && Cloud.state.profile && !Cloud.state.profile.groupId) { share.on = false; saveShare(); }
+      const gid = Cloud.state.group ? Cloud.state.group.id : null;
+      if (gid !== lastGroupId) { lastGroupId = gid; if (share.on && gid) maybeSendLive(true); }
+      if (sheetKind === "group") renderGroup();
+      if (sheetKind === "tracks") renderTracks();
+    }
+  });
+  Cloud.init();
+  setInterval(() => { maybeSendLive(); renderTeam(); }, 30000);
   drawAreaOutlines();
   loadWMZ();
   loadOsDomains();
