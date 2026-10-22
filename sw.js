@@ -3,7 +3,7 @@
    - map tiles: saved-area cache first, then a capped runtime cache, then network
    - data APIs (parcel lookups, weather): straight to network; the app keeps its own copies */
 
-const VERSION = "greylock-v1.1.2";
+const VERSION = "greylock-v1.1.3";
 const SHELL_CACHE = `${VERSION}-shell`;
 const OFFLINE_TILES = "greylock-tiles-offline";   // tiles from saved areas, never trimmed here
 const RUNTIME_TILES = "greylock-tiles-runtime";   // tiles you scrolled past, capped

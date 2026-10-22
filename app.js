@@ -555,6 +555,9 @@ function renderChips() {
   if (rec) {
     html += `<button class="chip" data-act="tab" data-tab="tracks"><span class="dot"></span>Recording ${fmtDist(rec.dist)}, ${fmtClock(Date.now() - rec.start)}</button>`;
   }
+  if (rec || (share.on && Cloud.state.group)) {
+    html += `<button class="chip" data-act="pocket" aria-label="Pocket mode: black out the screen and keep GPS running"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" aria-hidden="true"><path d="M20 14.5A8 8 0 0 1 9.5 4a8 8 0 1 0 10.5 10.5z"/></svg>Pocket mode</button>`;
+  }
   if (guide) {
     let txt = "Waiting for GPS", rot = 0;
     if (me) {
@@ -1416,7 +1419,7 @@ function renderGroup(open) {
           <div class="code">${esc(code)}</div>
           <div class="actions" style="margin-top:10px"><button class="btn" data-act="copy" data-text="${esc(code)}">Copy code</button>${navigator.share ? `<button class="btn" data-act="group-share">Send invite</button>` : ""}</div>
           ${g.locked ? `<p class="small" style="margin:8px 0 0">Locked. New members can’t join.</p>` : ""}</div></div>
-        <div class="sec"><button class="toggle" data-act="share-toggle" aria-pressed="${share.on}"><span class="t-text">Share my location<small>${share.on ? `Your group sees you until ${fmtTime(new Date(share.until))}. Updates only while Greylock is open.` : "Off. Your group can’t see where you are."}</small></span><span class="switch"></span></button></div>
+        <div class="sec"><button class="toggle" data-act="share-toggle" aria-pressed="${share.on}"><span class="t-text">Share my location<small>${share.on ? `Your group sees you until ${fmtTime(new Date(share.until))}. Updates only while Greylock is open.` : "Off. Your group can’t see where you are."}</small></span><span class="switch"></span></button>${share.on ? `<button class="btn block" style="margin-top:6px" data-act="pocket">Pocket mode: black screen, keeps sharing</button>` : ""}</div>
         <div class="sec"><h3>Members</h3><ul class="list">${members.map((mb) => {
           const sharing = mb.l && mb.l.sharing && liveAge(mb.l) < 3 * 3600e3 && mb.uid !== me_.uid;
           const status = mb.uid === me_.uid ? (share.on ? "You, sharing" : "You") : sharing ? `Sharing, ${ageText(liveAge(mb.l)) === "now" ? "just now" : ageText(liveAge(mb.l)) + " ago"}${me ? `, ${fmtDist(distM(me, mb.l))} ${dir16(bearingDeg(me, mb.l))}` : ""}` : "Not sharing";
@@ -1483,15 +1486,26 @@ function updateGuide() {
 let rec = null, recLine = null, recTicker = null, wakeLock = null;
 const shownTracks = new Map();
 let trackList = [];
-async function keepAwake(on) {
+const wakeReasons = new Set();
+// Holds the screen awake while any reason (recording, pocket mode) needs it. Returns true if the lock is held.
+async function syncWake() {
   try {
-    if (on && "wakeLock" in navigator) { wakeLock = await navigator.wakeLock.request("screen"); }
-    else if (!on && wakeLock) { await wakeLock.release(); wakeLock = null; }
-  } catch (e) { /* not supported or denied */ }
+    if (wakeReasons.size) {
+      if (!("wakeLock" in navigator)) return false;
+      if (!wakeLock || wakeLock.released) wakeLock = await navigator.wakeLock.request("screen");
+      return true;
+    }
+    if (wakeLock) { await wakeLock.release(); wakeLock = null; }
+  } catch (e) { return false; }
+  return false;
+}
+function keepAwake(on, reason = "rec") {
+  if (on) wakeReasons.add(reason); else wakeReasons.delete(reason);
+  return syncWake();
 }
 document.addEventListener("visibilitychange", () => {
   if (document.visibilityState !== "visible") return;
-  if (rec && prefs.keepAwake) keepAwake(true);
+  if (wakeReasons.size) syncWake(); // the lock drops whenever the app is hidden
   updateStatus();
   refreshWeather();
   maybeSendLive(true);
@@ -1568,7 +1582,8 @@ async function renderTracks(open) {
   let html = `<div class="sec">`;
   if (rec) {
     html += `<div class="row"><div class="grow"><div class="big">${fmtDist(rec.dist)}</div><div class="muted">${fmtClock(Date.now() - rec.start)} recording, ${rec.points.length} points</div></div>
-      <button class="btn primary" data-act="rec-stop">Stop and save</button></div>`;
+      <button class="btn primary" data-act="rec-stop">Stop and save</button></div>
+      <button class="btn block" style="margin-top:10px" data-act="pocket">Pocket mode: black screen, keeps recording</button>`;
   } else {
     html += `<button class="btn primary block" data-act="rec-start">Start recording</button>`;
   }
@@ -1621,6 +1636,66 @@ async function trackAction(act, id) {
     toast("Track deleted");
   }
   renderTracks();
+}
+
+/* ================= pocket mode ================= */
+// A black, touch-proof screen that keeps GPS, recording and sharing running.
+// Black pixels are switched off on OLED screens, so this costs far less battery than the map.
+let pocket = null;
+async function enterPocket() {
+  if (pocket) return;
+  closeSheet();
+  const el = document.createElement("div");
+  el.className = "pocket";
+  el.setAttribute("role", "dialog");
+  el.setAttribute("aria-label", "Pocket mode is on. Press and hold anywhere to unlock.");
+  el.innerHTML = `<div class="pk-box"><div class="pk-time"></div><div class="pk-line"></div><div class="pk-gps"></div>
+    <div class="pk-intro">GPS keeps running. Turn your brightness down, and don’t press the side button: that locks the phone and pauses GPS.</div>
+    <div class="pk-hint"><svg class="pk-ring" viewBox="0 0 40 40" aria-hidden="true"><circle cx="20" cy="20" r="16"/></svg>Press and hold to unlock</div></div>`;
+  document.body.appendChild(el);
+  document.body.classList.add("pocketed");
+  pocket = { el, hold: null, start: Date.now() };
+  const held = await keepAwake(true, "pocket");
+  if (!held) el.classList.add("nowake");
+  if (!held) el.querySelector(".pk-intro").textContent = "This phone won’t let the app keep the screen awake. Set Auto-Lock to Never in Settings while you hunt, or GPS will stop when the screen sleeps.";
+  const begin = (e) => {
+    e.preventDefault();
+    el.classList.add("holding");
+    pocket.hold = setTimeout(exitPocket, 1200);
+  };
+  const cancel = () => { if (!pocket) return; el.classList.remove("holding"); clearTimeout(pocket.hold); };
+  el.addEventListener("pointerdown", begin);
+  ["pointerup", "pointercancel", "pointerleave"].forEach((t) => el.addEventListener(t, cancel));
+  ["click", "contextmenu", "touchmove"].forEach((t) => el.addEventListener(t, (e) => e.preventDefault(), { passive: false }));
+  pocketTick();
+  pocket.timer = setInterval(pocketTick, 15000);
+  setTimeout(() => pocket && pocket.el.classList.add("settled"), 12000);
+}
+function pocketTick() {
+  if (!pocket) return;
+  const el = pocket.el;
+  el.querySelector(".pk-time").textContent = new Date().toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+  const parts = [];
+  if (rec) parts.push(`Recording ${fmtDist(rec.dist)}, ${fmtDur(Date.now() - rec.start)}`);
+  if (share.on && Cloud.state.group) parts.push("Sharing location");
+  el.querySelector(".pk-line").textContent = parts.join(". ") || "Screen blacked out";
+  el.querySelector(".pk-gps").textContent = me ? `GPS within ${Math.round(me.acc * 1.09361)} yd` : "Waiting for GPS";
+  // drift the readout so nothing stays lit in one spot
+  const box = el.querySelector(".pk-box");
+  box.style.transform = `translate(${Math.round((Math.random() - 0.5) * 40)}vw, ${Math.round((Math.random() - 0.5) * 50)}vh)`;
+}
+function exitPocket() {
+  if (!pocket) return;
+  clearInterval(pocket.timer);
+  clearTimeout(pocket.hold);
+  pocket.el.remove();
+  pocket = null;
+  document.body.classList.remove("pocketed");
+  keepAwake(false, "pocket");
+  map.invalidateSize();
+  if (follow && me) map.panTo([me.lat, me.lng]);
+  renderChips();
+  updateStatus();
 }
 
 /* ================= weather, wind, sun ================= */
@@ -2152,6 +2227,7 @@ document.addEventListener("click", async (e) => {
       toast(follow ? "Following your location" : "Stopped following");
       return;
     case "cone": return setCone(!coneOn);
+    case "pocket": return enterPocket();
     case "drop-pin": closeSheet(); return newPinAt(map.getCenter(), "stand");
     case "pin-me": if (me) return newPinAt({ lat: me.lat, lng: me.lng }, "stand"); return;
     case "pin-here": return newPinAt({ lat: +el.dataset.lat, lng: +el.dataset.lng }, "stand");
@@ -2310,7 +2386,7 @@ map.on("click", (e) => {
   if (sheetKind === "download") return;
   showLandInfo(e.latlng);
 });
-document.addEventListener("keydown", (e) => { if (e.key === "Escape" && sheetKind) closeSheet(); });
+document.addEventListener("keydown", (e) => { if (e.key === "Escape") { if (pocket) exitPocket(); else if (sheetKind) closeSheet(); } });
 
 /* ================= start ================= */
 (async function init() {

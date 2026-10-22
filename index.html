@@ -319,6 +319,24 @@ textarea.input { min-height: 84px; resize: vertical; }
 .today-card .btn { background: var(--hemlock-2); color: var(--strip-ink); }
 .item .ti { color: #fff; }
 
+
+/* pocket mode */
+.pocket { position: fixed; inset: 0; z-index: 5000; background: #000; display: grid; place-items: center; touch-action: none; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; cursor: default; }
+body.pocketed #map, body.pocketed .strip, body.pocketed .tabs, body.pocketed .fabs, body.pocketed .chips, body.pocketed .pin-fab, body.pocketed .crosshair { visibility: hidden; }
+.pk-box { text-align: center; color: #5a5a5a; transition: transform 1.2s ease; max-width: 300px; padding: 0 20px; }
+.pk-time { font: 600 44px/1 var(--font-data); }
+.pk-line, .pk-gps { font: 600 17px/1.35 var(--font-data); margin-top: 8px; }
+.pk-intro { font-size: 15px; line-height: 1.45; margin-top: 18px; color: #8a8a8a; max-height: 220px; overflow: hidden; transition: opacity 1s, max-height 1s, margin 1s; }
+.pocket.settled:not(.nowake) .pk-intro { opacity: 0; max-height: 0; margin-top: 0; }
+.pocket.settled .pk-box { color: #3a3a3a; }
+.pk-hint { display: inline-flex; align-items: center; gap: 8px; margin-top: 18px; font: 600 14px var(--font-data); }
+.pk-ring { width: 22px; height: 22px; transform: rotate(-90deg); }
+.pk-ring circle { fill: none; stroke: currentColor; stroke-width: 3; stroke-dasharray: 101; stroke-dashoffset: 101; }
+.pocket.holding .pk-ring circle { stroke-dashoffset: 0; transition: stroke-dashoffset 1.2s linear; }
+.pocket.holding .pk-box { color: #8a8a8a; }
+:root[data-theme="night"] .pk-box { color: #4a120c; }
+:root[data-theme="night"] .pk-intro, :root[data-theme="night"] .pocket.holding .pk-box { color: #7a2418; }
+
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { transition: none !important; animation: none !important; }
 }
