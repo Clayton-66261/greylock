@@ -549,13 +549,14 @@ function renderChips() {
   if (navigator.onLine === false) {
     html += `<div class="chip offline" role="status"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M2 8.5a15 15 0 0 1 20 0M5 12a10 10 0 0 1 14 0M8.5 15.5a5 5 0 0 1 7 0M3 3l18 18"/></svg>Offline. Saved areas still work.</div>`;
   }
-  if (share.on && Cloud.state.group) {
-    html += `<button class="chip" data-act="tab" data-tab="group"><span class="dot" style="background:var(--blaze)"></span>Sharing location with ${esc(Cloud.state.group.name)}</button>`;
+  if (share.on && share.groups.length) {
+    const who = share.groups.length === 1 ? groupName(share.groups[0]) : `${share.groups.length} groups`;
+    html += `<button class="chip" data-act="tab" data-tab="group"><span class="dot" style="background:var(--blaze)"></span>Sharing location with ${esc(who)}</button>`;
   }
   if (rec) {
     html += `<button class="chip" data-act="tab" data-tab="tracks"><span class="dot"></span>Recording ${fmtDist(rec.dist)}, ${fmtClock(Date.now() - rec.start)}</button>`;
   }
-  if (rec || (share.on && Cloud.state.group)) {
+  if (rec || (share.on && share.groups.length)) {
     html += `<button class="chip" data-act="pocket" aria-label="Pocket mode: black out the screen and keep GPS running"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" aria-hidden="true"><path d="M20 14.5A8 8 0 0 1 9.5 4a8 8 0 1 0 10.5 10.5z"/></svg>Pocket mode</button>`;
   }
   if (guide) {
@@ -776,15 +777,31 @@ const Cloud = (() => {
       emit("auth");
     }
   }
+  // Every group you belong to is watched for its name and members; only the active
+  // group's pins and teammates are loaded onto the map.
+  const groupSubs = new Map();
+  state.groups = new Map();
+  let activeId = null;
+  const idsOf = (p) => (p ? (Array.isArray(p.groupIds) ? p.groupIds : p.groupId ? [p.groupId] : []) : []);
+  const cacheMiss = (snap) => !snap.exists() && snap.metadata && snap.metadata.fromCache;
+
   function onUser(u) {
-    unsub("user", "group", "gpins", "mpins", "live");
+    unsub("user", "gpins", "mpins", "live");
+    groupSubs.forEach((f) => f()); groupSubs.clear();
+    state.groups = new Map();
+    activeId = null;
     Object.assign(state, { user: u, profile: null, group: null, groupPins: [], myPins: [], live: [], ready: true });
     emit("auth"); emit("pins"); emit("live");
     if (!u) return;
     subs.user = F.onSnapshot(F.doc(db, "users", u.uid), (snap) => {
-      const prev = state.profile ? state.profile.groupId : undefined;
-      state.profile = snap.exists() ? snap.data() : { name: u.displayName || "", groupId: null };
-      if (state.profile.groupId !== prev) attachGroup(state.profile.groupId);
+      if (cacheMiss(snap)) return;
+      const p = snap.exists() ? snap.data() : { name: u.displayName || "" };
+      if (p.groupId && !Array.isArray(p.groupIds)) {
+        // accounts from the single-group version: move the group into the new list
+        F.setDoc(F.doc(db, "users", u.uid), { groupIds: [p.groupId], activeGroupId: p.activeGroupId || p.groupId, groupId: F.deleteField() }, { merge: true }).catch(() => {});
+      }
+      state.profile = p;
+      syncGroups(idsOf(p), p.activeGroupId || p.groupId || null);
       emit("auth");
     }, (e) => { state.error = e.message; emit("auth"); });
     subs.mpins = F.onSnapshot(F.collection(db, "users", u.uid, "pins"), (snap) => {
@@ -792,24 +809,42 @@ const Cloud = (() => {
       emit("pins");
     }, () => {});
   }
-  function attachGroup(gid) {
-    unsub("group", "gpins", "live");
-    state.group = null; state.groupPins = []; state.live = [];
-    emit("pins"); emit("live");
+  function syncGroups(ids, wantActive) {
+    for (const gid of ids) {
+      if (groupSubs.has(gid)) continue;
+      groupSubs.set(gid, F.onSnapshot(F.doc(db, "groups", gid), (snap) => {
+        if (cacheMiss(snap)) return;
+        const g = snap.exists() ? { ...snap.data(), id: snap.id } : null;
+        if (!g || !(g.members || []).includes(uidNow())) { dropGroup(gid); return; }
+        state.groups.set(gid, g);
+        if (gid === activeId) state.group = g;
+        emit("auth");
+      }, () => dropGroup(gid)));
+    }
+    for (const [gid, f] of groupSubs) {
+      if (!ids.includes(gid)) { f(); groupSubs.delete(gid); state.groups.delete(gid); }
+    }
+    const active = ids.includes(wantActive) ? wantActive : ids[0] || null;
+    if (active !== activeId) attachActive(active);
+  }
+  // the group was deleted or the owner removed us
+  function dropGroup(gid) {
+    const f = groupSubs.get(gid);
+    if (f) f();
+    groupSubs.delete(gid);
+    state.groups.delete(gid);
+    const rest = idsOf(state.profile).filter((x) => x !== gid);
+    F.setDoc(F.doc(db, "users", uidNow()), { groupIds: F.arrayRemove(gid), ...(activeId === gid ? { activeGroupId: rest[0] || null } : {}) }, { merge: true }).catch(() => {});
+    if (activeId === gid) attachActive(rest[0] || null);
+    emit("auth");
+  }
+  function attachActive(gid) {
+    unsub("gpins", "live");
+    activeId = gid;
+    state.group = gid ? state.groups.get(gid) || null : null;
+    state.groupPins = []; state.live = [];
+    emit("pins"); emit("live"); emit("auth");
     if (!gid) return;
-    subs.group = F.onSnapshot(F.doc(db, "groups", gid), (snap) => {
-      const g = snap.exists() ? { ...snap.data(), id: snap.id } : null;
-      if (!g || !(g.members || []).includes(uidNow())) {
-        // the group was deleted or the owner removed us
-        state.group = null; state.groupPins = []; state.live = [];
-        unsub("gpins", "live");
-        F.setDoc(F.doc(db, "users", uidNow()), { groupId: null }, { merge: true }).catch(() => {});
-        emit("auth"); emit("pins"); emit("live");
-        return;
-      }
-      state.group = g;
-      emit("auth");
-    }, () => { state.group = null; emit("auth"); });
     subs.gpins = F.onSnapshot(F.collection(db, "groups", gid, "pins"), (snap) => {
       state.groupPins = snap.docs.map((d) => ({ ...d.data(), id: d.id, src: "group" }));
       emit("pins");
@@ -818,6 +853,11 @@ const Cloud = (() => {
       state.live = snap.docs.map((d) => ({ ...d.data(), uid: d.id }));
       emit("live");
     }, () => {});
+  }
+  function switchGroup(gid) {
+    if (!state.groups.has(gid) || gid === activeId) return;
+    attachActive(gid);
+    F.setDoc(F.doc(db, "users", uidNow()), { activeGroupId: gid }, { merge: true }).catch(() => {});
   }
 
   // reads that fall back to the on-phone copy instead of hanging without signal
@@ -829,7 +869,7 @@ const Cloud = (() => {
   async function signUp(name, email, pw) {
     const cred = await F.createUserWithEmailAndPassword(auth, email, pw);
     await F.updateProfile(cred.user, { displayName: name });
-    await F.setDoc(F.doc(db, "users", cred.user.uid), { name, email, groupId: null, created: Date.now() }, { merge: true });
+    await F.setDoc(F.doc(db, "users", cred.user.uid), { name, email, groupIds: [], activeGroupId: null, created: Date.now() }, { merge: true });
   }
   const signIn = (email, pw) => F.signInWithEmailAndPassword(auth, email, pw);
   const signOut = () => F.signOut(auth);
@@ -842,7 +882,7 @@ const Cloud = (() => {
   async function createGroup(name) {
     const uid = uidNow(), code = newCode();
     await F.setDoc(F.doc(db, "groups", code), { name: name || "Hunting group", ownerUid: uid, members: [uid], names: { [uid]: myName() }, locked: false, created: Date.now() });
-    await F.setDoc(F.doc(db, "users", uid), { groupId: code }, { merge: true });
+    await F.setDoc(F.doc(db, "users", uid), { groupIds: F.arrayUnion(code), activeGroupId: code }, { merge: true });
     return code;
   }
   async function joinGroup(raw) {
@@ -856,38 +896,40 @@ const Cloud = (() => {
       if (g.locked) throw new Error("That group isn’t taking new members right now.");
       await F.updateDoc(ref, { members: F.arrayUnion(uid), [`names.${uid}`]: myName() });
     }
-    await F.setDoc(F.doc(db, "users", uid), { groupId: code }, { merge: true });
+    await F.setDoc(F.doc(db, "users", uid), { groupIds: F.arrayUnion(code), activeGroupId: code }, { merge: true });
   }
-  async function leaveGroup() {
-    const g = state.group, uid = uidNow();
+  async function leaveGroup(gid = activeId) {
+    const g = state.groups.get(gid), uid = uidNow();
     if (!g) return;
-    await F.deleteDoc(F.doc(db, "groups", g.id, "live", uid)).catch(() => {});
-    if (g.ownerUid === uid) await F.deleteDoc(F.doc(db, "groups", g.id));
-    else await F.updateDoc(F.doc(db, "groups", g.id), { members: F.arrayRemove(uid), [`names.${uid}`]: F.deleteField() });
-    await F.setDoc(F.doc(db, "users", uid), { groupId: null }, { merge: true });
+    await F.deleteDoc(F.doc(db, "groups", gid, "live", uid)).catch(() => {});
+    if (g.ownerUid === uid) await F.deleteDoc(F.doc(db, "groups", gid));
+    else await F.updateDoc(F.doc(db, "groups", gid), { members: F.arrayRemove(uid), [`names.${uid}`]: F.deleteField() });
+    const rest = idsOf(state.profile).filter((x) => x !== gid);
+    await F.setDoc(F.doc(db, "users", uid), { groupIds: F.arrayRemove(gid), activeGroupId: rest[0] || null }, { merge: true });
   }
   async function removeMember(memberUid) {
-    const g = state.group;
-    await F.updateDoc(F.doc(db, "groups", g.id), { members: F.arrayRemove(memberUid), [`names.${memberUid}`]: F.deleteField() });
-    F.deleteDoc(F.doc(db, "groups", g.id, "live", memberUid)).catch(() => {});
+    await F.updateDoc(F.doc(db, "groups", activeId), { members: F.arrayRemove(memberUid), [`names.${memberUid}`]: F.deleteField() });
+    F.deleteDoc(F.doc(db, "groups", activeId, "live", memberUid)).catch(() => {});
   }
-  const setLocked = (locked) => F.updateDoc(F.doc(db, "groups", state.group.id), { locked });
+  const setLocked = (locked) => F.updateDoc(F.doc(db, "groups", activeId), { locked });
 
   /* live location: writes are queued by Firestore when there's no signal, so never await them in the GPS path */
-  function sendLive(p, hdg) {
-    if (!state.group || !uidNow()) return Promise.resolve();
-    return F.setDoc(F.doc(db, "groups", state.group.id, "live", uidNow()), {
-      name: myName(), lat: +p.lat.toFixed(6), lng: +p.lng.toFixed(6), acc: Math.round(p.acc || 0),
-      heading: hdg == null ? null : Math.round(hdg), sharing: true, ct: Date.now(), t: F.serverTimestamp(),
-    });
+  function sendLive(p, hdg, gids) {
+    if (!uidNow()) return Promise.resolve();
+    const body = { name: myName(), lat: +p.lat.toFixed(6), lng: +p.lng.toFixed(6), acc: Math.round(p.acc || 0),
+      heading: hdg == null ? null : Math.round(hdg), sharing: true, ct: Date.now(), t: F.serverTimestamp() };
+    const mine = idsOf(state.profile);
+    return Promise.all((gids || []).filter((g) => mine.includes(g)).map((g) => F.setDoc(F.doc(db, "groups", g, "live", uidNow()), body)));
   }
-  function stopLive() {
-    if (!state.group || !uidNow()) return Promise.resolve();
-    return F.setDoc(F.doc(db, "groups", state.group.id, "live", uidNow()), { name: myName(), sharing: false, ct: Date.now(), t: F.serverTimestamp() }, { merge: true });
+  function stopLive(gids) {
+    if (!uidNow()) return Promise.resolve();
+    const body = { name: myName(), sharing: false, ct: Date.now(), t: F.serverTimestamp() };
+    const mine = idsOf(state.profile);
+    return Promise.all((gids || []).filter((g) => mine.includes(g)).map((g) => F.setDoc(F.doc(db, "groups", g, "live", uidNow()), body, { merge: true })));
   }
 
   /* pins: shared ones live in the group, private ones under your account */
-  const pinRef = (id, src) => (src === "group" ? F.doc(db, "groups", state.group.id, "pins", id) : F.doc(db, "users", uidNow(), "pins", id));
+  const pinRef = (id, src) => (src === "group" ? F.doc(db, "groups", activeId, "pins", id) : F.doc(db, "users", uidNow(), "pins", id));
   const mediaRef = (id, src) => F.doc(pinRef(id, src), "media", "photo");
   async function getPhotoData(id, src) {
     try { const s = await getDocSmart(mediaRef(id, src)); return s.exists() ? s.data().data : null; } catch (e) { return null; }
@@ -904,7 +946,7 @@ const Cloud = (() => {
   }
   // photo: undefined keeps the current one, null removes it, a Blob replaces it
   async function savePin(pin, photo, prevSrc) {
-    const src = pin.shared && state.group ? "group" : "mine";
+    const src = pin.shared && activeId ? "group" : "mine";
     const { src: _ignored, ...rest } = pin;
     const data = { ...rest, shared: src === "group", ownerUid: pin.ownerUid || uidNow(), ownerName: pin.ownerName || myName() };
     const writes = [F.setDoc(pinRef(pin.id, src), data)];
@@ -955,19 +997,26 @@ const Cloud = (() => {
     await F.updateProfile(auth.currentUser, { displayName: name }).catch(() => {});
     await F.setDoc(F.doc(db, "users", uid), { name, email: state.user.email || "" }, { merge: true });
     if (state.profile) state.profile.name = name;
-    if (state.group) await F.updateDoc(F.doc(db, "groups", state.group.id), { [`names.${uid}`]: name });
-    for (const p of state.groupPins.filter((x) => x.ownerUid === uid)) F.updateDoc(pinRef(p.id, "group"), { ownerName: name }).catch(() => {});
+    for (const gid of state.groups.keys()) {
+      await F.updateDoc(F.doc(db, "groups", gid), { [`names.${uid}`]: name }).catch(() => {});
+      const snap = await getDocsSmart(F.collection(db, "groups", gid, "pins")).catch(() => null);
+      for (const d of snap ? snap.docs : []) if (d.data().ownerUid === uid) F.updateDoc(d.ref, { ownerName: name }).catch(() => {});
+    }
     for (const p of state.myPins) F.updateDoc(pinRef(p.id, "mine"), { ownerName: name }).catch(() => {});
     emit("auth");
   }
   async function deleteAccount(password) {
     const u = state.user, uid = u.uid;
     await F.reauthenticateWithCredential(u, F.EmailAuthProvider.credential(u.email, password));
-    for (const p of state.groupPins.filter((x) => x.ownerUid === uid)) {
-      await F.deleteDoc(mediaRef(p.id, "group")).catch(() => {});
-      await F.deleteDoc(pinRef(p.id, "group")).catch(() => {});
+    for (const gid of [...state.groups.keys()]) {
+      const snap = await F.getDocs(F.collection(db, "groups", gid, "pins")).catch(() => null);
+      for (const d of snap ? snap.docs : []) {
+        if (d.data().ownerUid !== uid) continue;
+        await F.deleteDoc(F.doc(d.ref, "media", "photo")).catch(() => {});
+        await F.deleteDoc(d.ref).catch(() => {});
+      }
+      await leaveGroup(gid).catch(() => {});
     }
-    if (state.group) await leaveGroup().catch(() => {});
     for (const name of ["pins", "tracks", "trackpts"]) {
       const snap = await F.getDocs(F.collection(db, "users", uid, name));
       for (const d of snap.docs) {
@@ -981,6 +1030,7 @@ const Cloud = (() => {
 
   return {
     state, init, on: (h) => handlers.add(h), signedIn: () => !!state.user, myName, uid: uidNow, cleanCode,
+    activeId: () => activeId, groupIds: () => (state.profile ? idsOf(state.profile) : null), switchGroup,
     signUp, signIn, signOut, resetPassword, createGroup, joinGroup, leaveGroup, removeMember, setLocked,
     sendLive, stopLive, savePin, deletePin, getPhoto, optimistic, listTracks, getTrack, saveTrack, renameTrack, deleteTrack, deleteAccount, rename,
   };
@@ -1115,7 +1165,7 @@ function renderPins(open) {
     </div></div>`;
   if (pins.length) {
     const chip = (key, label) => `<button class="${filter === key ? "on" : ""}" data-act="pin-filter" data-type="${key}">${esc(label)}</button>`;
-    html += `<div class="filters" role="group" aria-label="Filter pins">${chip("all", `All ${pins.length}`)}${inGroup ? chip("group", "Group") + chip("mine", "Mine") : ""}${types.map((t) => chip(t, PIN_TYPES[t]?.label || t)).join("")}</div>`;
+    html += `<div class="filters" role="group" aria-label="Filter pins">${chip("all", `All ${pins.length}`)}${inGroup ? chip("group", Cloud.state.group.name || "Group") + chip("mine", "Mine") : ""}${types.map((t) => chip(t, PIN_TYPES[t]?.label || t)).join("")}</div>`;
     html += `<ul class="list">${list.map(({ p, d }) => `<li><button class="item" data-act="open-pin" data-id="${p.id}">${typeIcon(PIN_TYPES[p.type] || PIN_TYPES.note)}<span class="meta"><b>${esc(pinName(p))}</b><small>${esc([PIN_TYPES[p.type]?.label, inGroup ? pinWho(p) : ""].filter(Boolean).join(", "))}${p.notes ? " – " + esc(p.notes.slice(0, 50)) : ""}</small></span><span class="end">${fmtDist(d)}<br><small class="muted">${dir16(bearingDeg(loc, p))}</small></span></button></li>`).join("")}</ul>`;
     html += `<p class="note">Sorted by distance from ${loc.gps ? "you" : "the map center"}.</p>`;
   } else {
@@ -1157,7 +1207,7 @@ async function showPin(id) {
 
 let editing = null;
 function newPinAt(latlng, type = "stand") {
-  const pin = { id: uid(), type, name: "", notes: "", winds: [], lat: latlng.lat, lng: latlng.lng, created: Date.now(), updated: Date.now(), shared: !!Cloud.state.group, src: null };
+  const pin = { id: uid(), type, name: "", notes: "", winds: [], lat: latlng.lat, lng: latlng.lng, created: Date.now(), updated: Date.now(), shared: !!Cloud.activeId(), src: null };
   const m = L.marker([pin.lat, pin.lng], { icon: pinIcon(type), draggable: true, zIndexOffset: 900 }).addTo(map);
   m.on("drag", () => { const ll = m.getLatLng(); if (editing) { editing.pin.lat = ll.lat; editing.pin.lng = ll.lng; const c = $("#editCoords"); if (c) c.textContent = fmtCoord(editing.pin); } });
   editing = { pin, isNew: true, temp: m, photo: undefined };
@@ -1283,34 +1333,50 @@ async function shrinkImage(file, max = 1280, quality = 0.82) {
 }
 
 /* ================= group: members, live locations ================= */
-const share = { on: false, until: 0, lastSent: 0, lastPos: null };
+const share = { on: false, until: 0, lastSent: 0, lastPos: null, groups: [] };
 try { Object.assign(share, JSON.parse(localStorage.getItem("greylock.share") || "{}")); } catch (e) { /* ignore */ }
-const saveShare = () => { try { localStorage.setItem("greylock.share", JSON.stringify({ on: share.on, until: share.until })); } catch (e) { /* ignore */ } };
+if (!Array.isArray(share.groups)) share.groups = [];
+const saveShare = () => { try { localStorage.setItem("greylock.share", JSON.stringify({ on: share.on, until: share.until, groups: share.groups })); } catch (e) { /* ignore */ } };
 function shareStopTime() {
   const now = Date.now();
   const end = legalTimes(new Date(), here()).end.getTime() + 3600e3;
   return now < end ? end : now + 3 * 3600e3; // after dark, keep sharing three hours for the walk out
 }
-function setSharing(on) {
-  if (on && !Cloud.state.group) { toast("Join a group first"); return; }
-  share.on = on;
-  share.until = on ? shareStopTime() : 0;
+const groupName = (gid) => (Cloud.state.groups.get(gid) || {}).name || "your group";
+// turn sharing on or off for one group (the active one by default)
+function setSharing(on, gid = Cloud.activeId()) {
+  if (!gid) { if (on) toast("Join a group first"); return; }
+  if (on) {
+    if (!share.groups.includes(gid)) share.groups.push(gid);
+    if (!share.on) share.until = shareStopTime();
+    share.on = true;
+  } else {
+    share.groups = share.groups.filter((g) => g !== gid);
+    Cloud.stopLive([gid]).catch(() => {});
+    if (!share.groups.length) { share.on = false; share.until = 0; }
+  }
   share.lastSent = 0;
   saveShare();
   if (on) { if (me) maybeSendLive(true); else toast("Sharing starts once GPS finds you"); }
-  else Cloud.stopLive().catch(() => {});
+  renderChips();
+  if (sheetKind === "group") renderGroup();
+}
+function stopAllSharing() {
+  Cloud.stopLive(share.groups).catch(() => {});
+  share.groups = []; share.on = false; share.until = 0;
+  saveShare();
   renderChips();
   if (sheetKind === "group") renderGroup();
 }
 function maybeSendLive(force) {
-  if (!share.on || !me || !Cloud.state.group) return;
-  if (Date.now() > share.until) { setSharing(false); toast("Location sharing turned off for the day"); return; }
+  if (!share.on || !me || !share.groups.length) return;
+  if (Date.now() > share.until) { stopAllSharing(); toast("Location sharing turned off for the day"); return; }
   const since = Date.now() - share.lastSent;
   const moved = share.lastPos ? distM(share.lastPos, me) : Infinity;
   if (force || since > 60000 || (since > 15000 && moved > 25)) {
     share.lastSent = Date.now();
     share.lastPos = { lat: me.lat, lng: me.lng };
-    Cloud.sendLive(me, heading).catch(() => {});
+    Cloud.sendLive(me, heading, share.groups).catch(() => {});
   }
 }
 
@@ -1405,34 +1471,50 @@ function renderGroup(open) {
     } else {
       html += `<div class="sec"><div class="row"><div class="grow"><p style="margin:0">Signed in as <b>${esc(Cloud.myName())}</b></p><p class="note" style="margin-top:2px">${esc(me_.email || "")}</p></div><button class="btn" data-act="name-edit" aria-label="Change your name">Change name</button></div></div>`;
     }
-    if (!g) {
-      html += `<div class="sec"><h3>Join your group</h3><p class="note" style="margin-top:0">Enter the invite code someone in your group sent you.</p>
+    const joinCreate = (first) => `<div class="sec"><h3>${first ? "Join your group" : "Join another group"}</h3><p class="note" style="margin-top:0">Enter the invite code someone sent you.</p>
         <div class="row"><input class="input grow" id="joinCode" placeholder="ABCD-1234" autocapitalize="characters" autocomplete="off" maxlength="9" style="text-transform:uppercase;font-family:var(--font-data);font-size:20px;letter-spacing:.08em"><button class="btn primary" data-act="group-join">Join</button></div></div>
-        <div class="sec"><h3>Or start a new group</h3><div class="row"><input class="input grow" id="groupName" placeholder="Group name" maxlength="40"><button class="btn" data-act="group-create">Create</button></div></div>
+        <div class="sec"><h3>${first ? "Or start a new group" : "Start another group"}</h3><div class="row"><input class="input grow" id="groupName" placeholder="Group name" maxlength="40"><button class="btn" data-act="group-create">Create</button></div></div>
         <div class="warn" id="groupErr" hidden></div>`;
+    const myGroups = [...s.groups.values()].sort((x, y) => (x.name || "").localeCompare(y.name || ""));
+    if (!g) {
+      html += myGroups.length ? `<div class="sec"><p class="muted">Loading your group…</p></div>` : joinCreate(true);
     } else {
       const isOwner = g.ownerUid === me_.uid;
       const code = `${g.id.slice(0, 4)}-${g.id.slice(4)}`;
       const live = new Map(s.live.map((l) => [l.uid, l]));
       const members = (g.members || []).map((u) => ({ uid: u, name: (g.names || {})[u] || (live.get(u) || {}).name || "Member", l: live.get(u) }));
+      const sharingHere = share.groups.includes(g.id);
+      const sharingElsewhere = share.groups.filter((x) => x !== g.id);
+      if (myGroups.length > 1) {
+        html += `<div class="sec"><h3>Your groups</h3><ul class="list">${myGroups.map((gr) => {
+          const active = gr.id === g.id;
+          const bits = [`${(gr.members || []).length} member${(gr.members || []).length === 1 ? "" : "s"}`];
+          if (active) bits.push("on the map now");
+          if (share.groups.includes(gr.id)) bits.push("sharing your location");
+          return `<li><div class="item"><span class="meta"><b>${esc(gr.name)}</b><small>${esc(bits.join(", "))}</small></span>${active ? `<span class="badge public">Active</span>` : `<button class="btn" style="min-height:40px;padding:0 14px" data-act="group-switch" data-gid="${gr.id}">Show</button>`}</div></li>`;
+        }).join("")}</ul></div>`;
+      }
       html += `<div class="sec"><div class="today-card"><h3>${esc(g.name)}</h3><div class="muted small" style="color:var(--strip-ink-2)">Invite code</div>
           <div class="code">${esc(code)}</div>
           <div class="actions" style="margin-top:10px"><button class="btn" data-act="copy" data-text="${esc(code)}">Copy code</button>${navigator.share ? `<button class="btn" data-act="group-share">Send invite</button>` : ""}</div>
           ${g.locked ? `<p class="small" style="margin:8px 0 0">Locked. New members can’t join.</p>` : ""}</div></div>
-        <div class="sec"><button class="toggle" data-act="share-toggle" aria-pressed="${share.on}"><span class="t-text">Share my location<small>${share.on ? `Your group sees you until ${fmtTime(new Date(share.until))}. Updates only while Greylock is open.` : "Off. Your group can’t see where you are."}</small></span><span class="switch"></span></button>${share.on ? `<button class="btn block" style="margin-top:6px" data-act="pocket">Pocket mode: black screen, keeps sharing</button>` : ""}</div>
+        <div class="sec"><button class="toggle" data-act="share-toggle" aria-pressed="${sharingHere}"><span class="t-text">Share my location with ${esc(g.name)}<small>${sharingHere ? `They see you until ${fmtTime(new Date(share.until))}. Updates only while Greylock is open.` : "Off. This group can’t see where you are."}</small></span><span class="switch"></span></button>
+          ${sharingElsewhere.length ? `<p class="note">Also sharing with ${esc(sharingElsewhere.map(groupName).join(", "))}.</p><div class="actions" style="margin-top:6px"><button class="btn" data-act="share-stop-all">Stop sharing with all groups</button></div>` : ""}
+          ${share.on ? `<button class="btn block" style="margin-top:8px" data-act="pocket">Pocket mode: black screen, keeps sharing</button>` : ""}</div>
         <div class="sec"><h3>Members</h3><ul class="list">${members.map((mb) => {
           const sharing = mb.l && mb.l.sharing && liveAge(mb.l) < 3 * 3600e3 && mb.uid !== me_.uid;
-          const status = mb.uid === me_.uid ? (share.on ? "You, sharing" : "You") : sharing ? `Sharing, ${ageText(liveAge(mb.l)) === "now" ? "just now" : ageText(liveAge(mb.l)) + " ago"}${me ? `, ${fmtDist(distM(me, mb.l))} ${dir16(bearingDeg(me, mb.l))}` : ""}` : "Not sharing";
+          const status = mb.uid === me_.uid ? (sharingHere ? "You, sharing" : "You") : sharing ? `Sharing, ${ageText(liveAge(mb.l)) === "now" ? "just now" : ageText(liveAge(mb.l)) + " ago"}${me ? `, ${fmtDist(distM(me, mb.l))} ${dir16(bearingDeg(me, mb.l))}` : ""}` : "Not sharing";
           return `<li><div class="item"><span class="ti" style="background:${mateColor(mb.uid)};font:700 14px var(--font-data)">${esc(initials(mb.name))}</span><span class="meta"><b>${esc(mb.name)}${mb.uid === g.ownerUid ? " <small class='muted'>owner</small>" : ""}</b><small>${esc(status)}</small></span>
             <span class="row">${sharing ? `<button class="btn" style="min-height:40px;padding:0 12px" data-act="mate-go" data-uid="${mb.uid}">Find</button>` : ""}${isOwner && mb.uid !== me_.uid ? `<button class="btn danger" style="min-height:40px;padding:0 12px" data-act="group-remove" data-uid="${mb.uid}" aria-label="Remove ${esc(mb.name)}">Remove</button>` : ""}</span></div></li>`;
         }).join("")}</ul>
         ${isOwner ? `<button class="toggle" data-act="group-lock" aria-pressed="${!!g.locked}"><span class="t-text">Lock the group<small>Stops anyone new from joining with the code</small></span><span class="switch"></span></button>` : ""}</div>`;
+      html += joinCreate(false);
     }
     const localCount = localPins.length;
     if (localCount) {
       html += `<div class="sec"><h3>Pins on this phone</h3><p class="note" style="margin-top:0">${localCount} pin${localCount === 1 ? " is" : "s are"} saved only on this phone. Move them into your account so they sync. They stay private until you share them.</p><div class="actions"><button class="btn" data-act="move-local">Move to my account</button></div></div>`;
     }
-    html += `<div class="sec"><div class="actions" style="margin-top:0"><button class="btn" data-act="auth-signout">Sign out</button>${g ? `<button class="btn danger" data-act="group-leave">${g.ownerUid === me_.uid ? "Delete group" : "Leave group"}</button>` : ""}<button class="btn danger" data-act="account-delete">Delete account</button></div></div>`;
+    html += `<div class="sec"><div class="actions" style="margin-top:0"><button class="btn" data-act="auth-signout">Sign out</button>${g ? `<button class="btn danger" data-act="group-leave">${g.ownerUid === me_.uid ? `Delete ${esc(g.name)}` : `Leave ${esc(g.name)}`}</button>` : ""}<button class="btn danger" data-act="account-delete">Delete account</button></div></div>`;
   }
   if (open || sheetKind !== "group") openSheet("Group", html, { kind: "group", tall: true });
   else {
@@ -1677,7 +1759,7 @@ function pocketTick() {
   el.querySelector(".pk-time").textContent = new Date().toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
   const parts = [];
   if (rec) parts.push(`Recording ${fmtDist(rec.dist)}, ${fmtDur(Date.now() - rec.start)}`);
-  if (share.on && Cloud.state.group) parts.push("Sharing location");
+  if (share.on && share.groups.length) parts.push(share.groups.length > 1 ? `Sharing location with ${share.groups.length} groups` : "Sharing location");
   el.querySelector(".pk-line").textContent = parts.join(". ") || "Screen blacked out";
   el.querySelector(".pk-gps").textContent = me ? `GPS within ${Math.round(me.acc * 1.09361)} yd` : "Waiting for GPS";
   // drift the readout so nothing stays lit in one spot
@@ -2271,16 +2353,16 @@ document.addEventListener("click", async (e) => {
       return;
     }
     case "auth-signout":
-      if (share.on) setSharing(false);
+      if (share.on) stopAllSharing();
       await Cloud.signOut();
       return toast("Signed out");
     case "group-create": {
-      try { await Cloud.createGroup(($("#groupName").value || "").trim()); toast("Group created. Send the invite code to your crew."); }
+      try { await Cloud.createGroup(($("#groupName").value || "").trim()); $("#sheetBody").scrollTop = 0; toast("Group created. Send the invite code to your crew."); }
       catch (err) { showErr("groupErr", friendlyError(err)); }
       return;
     }
     case "group-join": {
-      try { await Cloud.joinGroup($("#joinCode").value); toast("You’re in"); }
+      try { await Cloud.joinGroup($("#joinCode").value); $("#sheetBody").scrollTop = 0; toast("You’re in"); }
       catch (err) { showErr("groupErr", friendlyError(err)); }
       return;
     }
@@ -2304,11 +2386,18 @@ document.addEventListener("click", async (e) => {
       const g = Cloud.state.group;
       const owner = g.ownerUid === Cloud.uid();
       if (!confirm(owner ? `Delete “${g.name}” for everyone? Shared pins in it will be lost.` : `Leave “${g.name}”? You’ll stop seeing its shared pins.`)) return;
-      if (share.on) setSharing(false);
-      try { await Cloud.leaveGroup(); toast(owner ? "Group deleted" : "You left the group"); } catch (err) { toast(friendlyError(err), 4000); }
+      if (share.groups.includes(g.id)) setSharing(false, g.id);
+      try { await Cloud.leaveGroup(g.id); toast(owner ? "Group deleted" : "You left the group"); } catch (err) { toast(friendlyError(err), 4000); }
       return;
     }
-    case "share-toggle": return setSharing(!share.on);
+    case "share-toggle": { const gid = Cloud.activeId(); return setSharing(!share.groups.includes(gid), gid); }
+    case "share-stop-all": return stopAllSharing();
+    case "group-switch": {
+      Cloud.switchGroup(el.dataset.gid);
+      $("#sheetBody").scrollTop = 0;
+      toast(`Showing ${groupName(el.dataset.gid)}`);
+      return;
+    }
     case "mate-go": { const l = Cloud.state.live.find((x) => x.uid === el.dataset.uid); if (l) { closeSheet(); map.setView([l.lat, l.lng], Math.max(map.getZoom(), 16)); showMate(l.uid); } return; }
     case "guide-mate": { const l = Cloud.state.live.find((x) => x.uid === el.dataset.uid); if (l) startGuide({ lat: l.lat, lng: l.lng, name: firstName(l.name), uid: l.uid }); return; }
     case "move-local": return moveLocalToAccount();
@@ -2330,7 +2419,7 @@ document.addEventListener("click", async (e) => {
       if (!confirm("Delete your account? Your private pins, tracks and shared pins are removed for good.")) return;
       const pw = prompt("Enter your password to confirm");
       if (!pw) return;
-      try { if (share.on) setSharing(false); await Cloud.deleteAccount(pw); toast("Account deleted"); }
+      try { if (share.on) stopAllSharing(); await Cloud.deleteAccount(pw); toast("Account deleted"); }
       catch (err) { toast(friendlyError(err), 4200); }
       return;
     }
@@ -2397,16 +2486,31 @@ document.addEventListener("keydown", (e) => { if (e.key === "Escape") { if (pock
   renderChips();
   startGPS();
   try { await loadPins(); } catch (e) { toast("Couldn't open saved pins on this device"); }
-  let lastGroupId = null;
+  let lastGroupId = null, groupsKnown = false;
   Cloud.on((what) => {
     if (what === "pins") refreshPins();
     if (what === "live") renderTeam();
     if (what === "auth") {
       refreshPins();
       renderChips();
-      if (share.on && !Cloud.state.group && Cloud.state.ready && Cloud.state.profile && !Cloud.state.profile.groupId) { share.on = false; saveShare(); }
-      const gid = Cloud.state.group ? Cloud.state.group.id : null;
-      if (gid !== lastGroupId) { lastGroupId = gid; if (share.on && gid) maybeSendLive(true); }
+      const gid = Cloud.activeId();
+      // sharing saved by the single-group version: carry it over to the active group
+      if (share.on && !share.groups.length && gid) { share.groups = [gid]; saveShare(); }
+      // forget groups you've left or been removed from
+      const ids = Cloud.groupIds();
+      if (ids && share.groups.some((g) => !ids.includes(g))) {
+        share.groups = share.groups.filter((g) => ids.includes(g));
+        if (!share.groups.length) { share.on = false; share.until = 0; }
+        saveShare();
+      }
+      if (gid !== lastGroupId) {
+        const switched = groupsKnown && !!gid;
+        groupsKnown = groupsKnown || !!gid;
+        lastGroupId = gid;
+        // switching groups while sharing keeps the old group and adds the new one
+        if (switched && share.on && !share.groups.includes(gid)) { share.groups.push(gid); saveShare(); }
+        if (share.on && gid) maybeSendLive(true);
+      }
       if (sheetKind === "group") renderGroup();
       if (sheetKind === "tracks") renderTracks();
     }
